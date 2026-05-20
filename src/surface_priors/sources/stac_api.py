@@ -41,6 +41,19 @@ CDSE_STAC_URL = "https://stac.dataspace.copernicus.eu/v1"
 
 S2_L2A_SR_SCALE = 0.0001
 
+# GDAL options that materially reduce HTTP round-trips when opening remote
+# COGs. These are safe for any /vsicurl/ HTTPS source; per-endpoint constructors
+# layer extra options on top (e.g. AWS_NO_SIGN_REQUEST for Element84).
+DEFAULT_GDAL_ENV: Mapping[str, str] = {
+    "GDAL_DISABLE_READDIR_ON_OPEN": "EMPTY_DIR",
+    "CPL_VSIL_CURL_USE_HEAD": "NO",
+    "VSI_CACHE": "YES",
+    "GDAL_HTTP_MERGE_CONSECUTIVE_RANGES": "YES",
+    "GDAL_HTTP_MULTIPLEX": "YES",
+}
+
+EARTH_SEARCH_GDAL_ENV: Mapping[str, str] = {**DEFAULT_GDAL_ENV, "AWS_NO_SIGN_REQUEST": "YES"}
+
 
 class AssetUrlSigner(Protocol):
     """Transforms a STAC item dict so its asset hrefs are GDAL-readable."""
@@ -203,6 +216,7 @@ class StacApiSource:
         name: Optional[str] = None,
         stac_client: Any = None,
         opener: Any = None,
+        gdal_env: Optional[Mapping[str, str]] = None,
     ) -> None:
         if not temporal_ranges:
             raise ValueError("StacApiSource requires explicit temporal_ranges")
@@ -226,6 +240,9 @@ class StacApiSource:
         self.scout_workers = max(1, int(scout_workers))
         self._stac_client = stac_client
         self._opener = opener  # injected rasterio.open replacement for tests
+        self.gdal_env: Mapping[str, str] = dict(gdal_env) if gdal_env is not None else dict(
+            DEFAULT_GDAL_ENV
+        )
         temporal_key = temporal_ranges_name(
             self.temporal_ranges,
             sample_every_days=self.sample_every_days,
@@ -248,6 +265,7 @@ class StacApiSource:
         temporal_ranges: Sequence[Tuple[str, str]],
         **kwargs: Any,
     ) -> "StacApiSource":
+        kwargs.setdefault("gdal_env", dict(EARTH_SEARCH_GDAL_ENV))
         return cls(
             stac_url=EARTH_SEARCH_URL,
             collection="sentinel-2-l2a",
@@ -521,11 +539,26 @@ class StacApiSource:
             except ImportError as exc:
                 raise ImportError("StacApiSource requires rasterio.") from exc
             opener = rasterio.open
+        env = self._env_context()
         try:
-            with opener(href) as dataset:
-                return _read_to_grid(dataset, grid=grid, resample=resample)
+            with env:
+                with opener(href) as dataset:
+                    return _read_to_grid(dataset, grid=grid, resample=resample)
         except (OSError, RuntimeError):
             return None
+
+    def _env_context(self):
+        if self._opener is not None or not self.gdal_env:
+            from contextlib import nullcontext
+
+            return nullcontext()
+        try:
+            import rasterio  # type: ignore
+        except ImportError:
+            from contextlib import nullcontext
+
+            return nullcontext()
+        return rasterio.Env(**self.gdal_env)
 
     def _client(self) -> Any:
         if self._stac_client is not None:
