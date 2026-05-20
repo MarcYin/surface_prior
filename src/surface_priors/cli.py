@@ -20,6 +20,7 @@ from surface_priors.sources.s2 import (
     DEFAULT_SCOUT_FACTOR,
 )
 from surface_priors.sources.s2_gee import S2L2AGeeSource
+from surface_priors.sources.stac_api import StacApiSource
 from surface_priors.temporal import temporal_ranges_name
 from surface_priors.types import DEFAULT_BANDS, DEFAULT_NATIVE_CRS, DEFAULT_S2_L2A_BANDS
 
@@ -57,6 +58,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--gee-collection-id",
         default=None,
         help="Generic Earth Engine ImageCollection ID fetched through edown.",
+    )
+    build.add_argument(
+        "--stac-source",
+        choices=("earth-search", "pc", "cdse"),
+        default=None,
+        help="STAC API endpoint for Sentinel-2 L2A (earth-search, pc, or cdse).",
+    )
+    build.add_argument(
+        "--stac-token",
+        default=None,
+        help="Bearer token for CDSE STAC reads. Optional for earth-search and pc.",
     )
     build.add_argument(
         "--temporal-range",
@@ -244,12 +256,13 @@ def _provider_config(args: argparse.Namespace) -> ProviderConfig:
             getattr(args, "product", None),
             getattr(args, "gee_product", None),
             getattr(args, "gee_collection_id", None),
+            getattr(args, "stac_source", None),
         )
     )
     if source_count > 1:
         raise SystemExit(
             "choose only one input source: --local-observations, --product, "
-            "--gee-product, or --gee-collection-id"
+            "--gee-product, --gee-collection-id, or --stac-source"
         )
     if getattr(args, "local_observations", None):
         source = LocalNpzSource(args.local_observations)
@@ -299,6 +312,22 @@ def _provider_config(args: argparse.Namespace) -> ProviderConfig:
                 overwrite=args.edown_overwrite,
                 sample_every_days=args.sample_every_days,
             )
+    elif getattr(args, "stac_source", None):
+        if not args.temporal_range:
+            raise SystemExit("--stac-source requires --temporal-range START END.")
+        temporal = tuple(tuple(value) for value in args.temporal_range)
+        common = {
+            "temporal_ranges": temporal,
+            "sample_every_days": args.sample_every_days,
+            "scout_factor": args.s2_scout_factor,
+            "chunk_size": args.chunk_size,
+        }
+        if args.stac_source == "earth-search":
+            source = StacApiSource.earth_search_s2_l2a(**common)
+        elif args.stac_source == "pc":
+            source = StacApiSource.planetary_computer_s2_l2a(**common)
+        else:
+            source = StacApiSource.cdse_s2_l2a(token=args.stac_token, **common)
     elif getattr(args, "product", None):
         band_patterns = _parse_band_patterns(args.band_pattern)
         if not band_patterns or not args.quality_pattern or not args.temporal_range:
@@ -333,6 +362,8 @@ def _provider_config(args: argparse.Namespace) -> ProviderConfig:
 
 def _default_bands_for(args: argparse.Namespace) -> Sequence[str]:
     if getattr(args, "gee_product", None) == "s2_l2a":
+        return DEFAULT_S2_L2A_BANDS
+    if getattr(args, "stac_source", None):
         return DEFAULT_S2_L2A_BANDS
     return DEFAULT_BANDS
 

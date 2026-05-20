@@ -51,6 +51,13 @@ earthdata = [
 gee = [
   "edown>=0.2.1",
 ]
+stac = [
+  "pystac-client>=0.8",
+]
+stac-pc = [
+  "pystac-client>=0.8",
+  "planetary-computer>=1.0",
+]
 experiments = [
   "earthaccess>=0.10",
   "edown>=0.2.1",
@@ -73,6 +80,8 @@ dev = [
 all = [
   "edown>=0.2.1",
   "earthaccess>=0.10",
+  "pystac-client>=0.8",
+  "planetary-computer>=1.0",
   "matplotlib>=3.7",
   "pyhdf>=0.11.6",
   "mkdocs>=1.6",

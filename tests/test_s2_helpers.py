@@ -8,6 +8,9 @@ from surface_priors.sources.s2 import (
     apply_zero_as_nodata,
     cloud_score_to_quality,
     cloud_score_valid_mask,
+    scl_clear_score,
+    scl_to_quality,
+    scl_valid_mask,
 )
 from surface_priors.types import GridSpec
 
@@ -87,6 +90,35 @@ def test_aggregate_chunk_stats_reduces_coarse_to_chunks():
     assert by_chunk[3].usable_fraction == 0.75  # one quarter of the block is masked out
     assert by_chunk[3].mean_clear == pytest.approx(0.8, rel=1e-5)
     assert by_chunk[1].mean_clear == pytest.approx(0.8, rel=1e-5)  # untouched block
+
+
+def test_scl_to_quality_buckets_classes_correctly():
+    scl = np.array([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11], dtype="int16")
+    quality = scl_to_quality(scl)
+    assert quality[0] == NODATA_QUALITY  # no_data
+    assert quality[1] == NODATA_QUALITY  # saturated
+    assert quality[2] == 2  # dark area
+    assert quality[3] == 2  # cloud shadow
+    assert quality[4] == 0  # vegetation
+    assert quality[5] == 0  # bare
+    assert quality[6] == 0  # water
+    assert quality[7] == 1  # unclassified
+    assert quality[8] == NODATA_QUALITY  # cloud medium
+    assert quality[9] == NODATA_QUALITY  # cloud high
+    assert quality[10] == NODATA_QUALITY  # cirrus
+    assert quality[11] == 0  # snow
+
+
+def test_scl_valid_mask_excludes_zero():
+    scl = np.array([[0, 4], [5, 1]], dtype="int16")
+    mask = scl_valid_mask(scl)
+    np.testing.assert_array_equal(mask, [[False, True], [True, True]])
+
+
+def test_scl_clear_score_is_one_for_clear_classes_only():
+    scl = np.array([4, 8, 11, 7], dtype="int16")
+    score = scl_clear_score(scl)
+    np.testing.assert_array_equal(score, [1.0, 0.0, 1.0, 0.0])
 
 
 def test_aggregate_chunk_stats_handles_fully_masked_block():

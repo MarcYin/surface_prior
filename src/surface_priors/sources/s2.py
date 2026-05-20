@@ -38,6 +38,12 @@ DEFAULT_SCOUT_FACTOR = 8
 DEFAULT_CHUNK_SIZE = 512
 NODATA_QUALITY = 65535
 
+SCL_NODATA = 0
+SCL_CLEAR_CLASSES = (4, 5, 6, 11)
+SCL_MARGINAL_CLASSES = (7,)
+SCL_DARK_CLASSES = (2, 3)
+SCL_BAD_CLASSES = (1, 8, 9, 10)
+
 
 def cloud_score_to_quality(
     score: np.ndarray,
@@ -66,6 +72,39 @@ def cloud_score_valid_mask(score: np.ndarray) -> np.ndarray:
 
     score = np.asarray(score)
     return np.isfinite(score) & (score >= 0.0) & (score <= 1.0)
+
+
+def scl_to_quality(scl: np.ndarray) -> np.ndarray:
+    """Map Sentinel-2 SCL classes to compositor quality (lower = better).
+
+    Clear classes (4, 5, 6, 11) map to 0. Unclassified (7) maps to 1.
+    Dark/shadow (2, 3) map to 2. SCL=0 (no-data) and 1, 8, 9, 10
+    (saturated/cloud/cirrus) map to the package-wide nodata sentinel.
+    """
+
+    scl = np.asarray(scl)
+    quality = np.full(scl.shape, NODATA_QUALITY, dtype="uint16")
+    quality[np.isin(scl, SCL_CLEAR_CLASSES)] = 0
+    quality[np.isin(scl, SCL_MARGINAL_CLASSES)] = 1
+    quality[np.isin(scl, SCL_DARK_CLASSES)] = 2
+    return quality
+
+
+def scl_valid_mask(scl: np.ndarray) -> np.ndarray:
+    """Pixels with non-zero SCL (i.e., real data)."""
+
+    return np.asarray(scl) != SCL_NODATA
+
+
+def scl_clear_score(scl: np.ndarray) -> np.ndarray:
+    """Per-pixel "clear" score for SCL: 1.0 if clear class, 0.0 otherwise.
+
+    Used so SCL-based scouting and CS+ scouting both report `mean_clear`
+    in [0, 1] with the same direction (higher = clearer).
+    """
+
+    scl = np.asarray(scl)
+    return np.where(np.isin(scl, SCL_CLEAR_CLASSES), 1.0, 0.0).astype("float32")
 
 
 def apply_zero_as_nodata(
