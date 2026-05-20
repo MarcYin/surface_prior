@@ -19,9 +19,18 @@ class _FakeChunkedSource:
     def block_size(self, *, grid, band_names):
         return None
 
-    def scout(self, *, grid, layout, band_names):
+    def scout(self, *, grid, layout, band_names, temporal_filter=None):
         self.scout_calls += 1
-        return self._stats
+        if temporal_filter is None:
+            return self._stats
+        # Only emit stats for scenes whose timestamp lands within the filter.
+        start, end = temporal_filter
+        keep = self._scene_filter(start, end)
+        return tuple(entry for entry in self._stats if entry.scene_index in keep)
+
+    def _scene_filter(self, start, end):
+        # Test sources can override this hook to declare per-scene datetimes.
+        return set(range(len(self._observations_by_scene)))
 
     def fetch_selected(self, *, grid, plan, band_names, scene_index, chunk_id):
         self.fetch_calls.append((scene_index, chunk_id))
@@ -204,6 +213,92 @@ def test_layout_uses_block_size_when_source_advertises_one(tmp_path):
     # block_size=4 promotes the chunk to 4, so we get a single chunk and one fetch.
     assert product.composite.attrs["chunk_size"] == 4
     assert source.fetch_calls == [(0, 0)]
+
+
+def test_temporal_filter_amortizes_scene_listing_across_months(tmp_path):
+    """Three monthly builds against one chunked source should share scout
+    bookkeeping but produce distinct request hashes and only fetch scenes
+    inside the per-build temporal filter."""
+
+    bands = ("iso",)
+
+    class _DatedFakeSource(_FakeChunkedSource):
+        def __init__(self):
+            obs = {}
+            for index in range(6):
+                obs[index] = {
+                    "data": np.full((1, 4, 4), 0.10 + 0.01 * index, dtype="float32"),
+                    "quality": np.full((4, 4), 4, dtype="uint16"),
+                }
+            stats = []
+            self.scene_dates = {
+                0: "2024-07-05",
+                1: "2024-07-25",
+                2: "2024-08-08",
+                3: "2024-08-22",
+                4: "2024-09-04",
+                5: "2024-09-19",
+            }
+            for scene in range(6):
+                for chunk in range(4):
+                    stats.append(
+                        SceneChunkStats(
+                            scene_index=scene,
+                            chunk_id=chunk,
+                            usable_fraction=1.0,
+                            mean_clear=0.9 - 0.01 * scene,
+                        )
+                    )
+            super().__init__(observations_by_scene=obs, stats=stats)
+            self.list_calls = 0
+
+        def _scene_filter(self, start, end):
+            return {
+                index
+                for index, date in self.scene_dates.items()
+                if start[:10] <= date <= end[:10]
+            }
+
+    source = _DatedFakeSource()
+    provider = Provider(
+        ProviderConfig(
+            cache_dir=tmp_path / "cache",
+            source=source,
+            chunk_size=2,
+            selection_policy=SelectionPolicy(top_k=2, min_usable_fraction=0.5),
+            fetch_workers=1,
+        )
+    )
+
+    months = [
+        ("2024-07-01", "2024-07-31"),
+        ("2024-08-01", "2024-08-31"),
+        ("2024-09-01", "2024-09-30"),
+    ]
+    hashes = []
+    fetched_scenes_per_month = []
+    for start, end in months:
+        before = len(source.fetch_calls)
+        product = provider.build_prior(
+            wgs84_bounds=(0.0, 0.0, 1.0, 1.0),
+            resolution=0.25,
+            product_id=f"monthly-{start[:7]}",
+            native_crs="EPSG:4326",
+            band_names=bands,
+            temporal_filter=(start, end),
+            composite_period=start[:7],
+        )
+        hashes.append(product.request["request_hash"])
+        new_calls = source.fetch_calls[before:]
+        fetched_scenes_per_month.append(sorted({scene for scene, _ in new_calls}))
+
+    # Distinct cache directories per month.
+    assert len(set(hashes)) == 3
+
+    # Each build only fetched scenes from its own month.
+    assert fetched_scenes_per_month[0] == [0, 1]
+    assert fetched_scenes_per_month[1] == [2, 3]
+    assert fetched_scenes_per_month[2] == [4, 5]
 
 
 def test_layout_iteration_independent_of_provider():

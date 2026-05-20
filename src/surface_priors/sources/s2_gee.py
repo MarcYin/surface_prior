@@ -180,9 +180,12 @@ class S2L2AGeeSource:
         grid: GridSpec,
         layout: ChunkLayout,
         band_names: Sequence[str],
+        temporal_filter: Optional[Tuple[str, str]] = None,
     ) -> Sequence[SceneChunkStats]:
         del band_names
         scenes = self.list_scenes(grid=grid)
+        if temporal_filter is not None:
+            scenes = _filter_gee_scenes_by_datetime(scenes, *temporal_filter)
         if not scenes:
             return ()
         ee = self._ee()
@@ -339,6 +342,30 @@ def _find_scene(scenes: Sequence[S2Scene], scene_index: int) -> Optional[S2Scene
         if scene.scene_index == scene_index:
             return scene
     return None
+
+
+def _filter_gee_scenes_by_datetime(
+    scenes: Sequence[S2Scene],
+    start: str,
+    end: str,
+) -> Tuple[S2Scene, ...]:
+    """Restrict GEE scenes to those acquired within [start, end] inclusive.
+
+    Scene timestamps are compared as ISO date prefixes against `timestamp_ms`
+    so the filter only depends on calendar dates. `scene_index` is preserved
+    so the SelectionPlan still references the source's full cache.
+    """
+
+    from datetime import date as _date
+
+    start_prefix = str(start)[:10]
+    end_prefix = str(end)[:10]
+    out: list[S2Scene] = []
+    for scene in scenes:
+        scene_date = _date.fromtimestamp(scene.timestamp_ms / 1000.0).isoformat()
+        if start_prefix <= scene_date <= end_prefix:
+            out.append(scene)
+    return tuple(out)
 
 
 def _coarse_grid(*, grid: GridSpec, scout_factor: int) -> GridSpec:

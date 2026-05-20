@@ -398,9 +398,12 @@ class StacApiSource:
         grid: GridSpec,
         layout: ChunkLayout,
         band_names: Sequence[str],
+        temporal_filter: Optional[Tuple[str, str]] = None,
     ) -> Sequence[SceneChunkStats]:
         del band_names
         scenes = self.list_scenes(grid=grid)
+        if temporal_filter is not None:
+            scenes = _filter_scenes_by_datetime(scenes, *temporal_filter)
         if not scenes:
             return ()
         coarse_shape = (
@@ -692,6 +695,27 @@ def _find_scene(scenes: Sequence[StacScene], scene_index: int) -> Optional[StacS
         if scene.scene_index == scene_index:
             return scene
     return None
+
+
+def _filter_scenes_by_datetime(
+    scenes: Sequence[StacScene],
+    start: str,
+    end: str,
+) -> Tuple[StacScene, ...]:
+    """Return scenes whose ISO datetime falls within [start, end] inclusive.
+
+    `scene_index` is preserved so a SelectionPlan built from the filtered
+    output still points at the right entry in the source's full cache when
+    `fetch_selected` resolves it.
+    """
+
+    start_prefix = str(start)[:10]
+    end_prefix = str(end)[:10]
+    return tuple(
+        scene
+        for scene in scenes
+        if start_prefix <= str(scene.datetime)[:10] <= end_prefix
+    )
 
 
 def _utm_crs_from_wgs84_bounds(wgs84_bounds: Sequence[float]) -> str:

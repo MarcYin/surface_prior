@@ -4,7 +4,7 @@ import inspect
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping, Optional, Sequence, Union
+from typing import Any, Mapping, Optional, Sequence, Tuple, Union
 
 from surface_priors.chunks import ChunkLayout
 from surface_priors.composite import ChunkedCompositor, PriorCompositor
@@ -58,6 +58,7 @@ class Provider:
         composite_period: Optional[str] = None,
         observations: Optional[Sequence[Observation]] = None,
         rebuild: bool = False,
+        temporal_filter: Optional[Sequence[str]] = None,
     ) -> PriorProduct:
         crs = native_crs if brdf_crs is None else brdf_crs
         band_names = tuple(str(band) for band in band_names)
@@ -67,11 +68,13 @@ class Provider:
             resolution=resolution,
             band_names=band_names,
         )
+        temporal_filter_tuple = _normalize_temporal_filter(temporal_filter)
         request = self._request_payload(
             grid=grid,
             product_id=product_id,
             band_names=band_names,
             composite_period=composite_period,
+            temporal_filter=temporal_filter_tuple,
         )
         request_hash = stable_json_hash(request)
         if not rebuild and self.store.has_product(request_hash):
@@ -82,6 +85,7 @@ class Provider:
                 product_id=product_id,
                 grid=grid,
                 band_names=band_names,
+                temporal_filter=temporal_filter_tuple,
             )
         else:
             if observations is None:
@@ -113,6 +117,7 @@ class Provider:
         product_id: str,
         grid: GridSpec,
         band_names: Sequence[str],
+        temporal_filter: Optional[Tuple[str, str]] = None,
     ):
         source = self.config.source
         assert source is not None
@@ -125,7 +130,14 @@ class Provider:
             chunk_size=self.config.chunk_size,
             block_size=block_size,
         )
-        stats = source.scout(grid=grid, layout=layout, band_names=band_names)
+        scout_kwargs: dict[str, Any] = {
+            "grid": grid,
+            "layout": layout,
+            "band_names": band_names,
+        }
+        if temporal_filter is not None and _scout_accepts_temporal_filter(source):
+            scout_kwargs["temporal_filter"] = temporal_filter
+        stats = source.scout(**scout_kwargs)
         plan = select(
             layout=layout,
             stats=stats,
@@ -165,6 +177,7 @@ class Provider:
         brdf_crs: Optional[str] = None,
         band_names: Sequence[str] = DEFAULT_BANDS,
         composite_period: Optional[str] = None,
+        temporal_filter: Optional[Sequence[str]] = None,
     ) -> str:
         crs = native_crs if brdf_crs is None else brdf_crs
         band_names = tuple(str(band) for band in band_names)
@@ -180,6 +193,7 @@ class Provider:
                 product_id=product_id,
                 band_names=band_names,
                 composite_period=composite_period,
+                temporal_filter=_normalize_temporal_filter(temporal_filter),
             )
         )
 
@@ -214,6 +228,7 @@ class Provider:
         product_id: str,
         band_names: Sequence[str],
         composite_period: Optional[str],
+        temporal_filter: Optional[Tuple[str, str]] = None,
     ) -> dict[str, Any]:
         source_name = self.config.source_name
         if source_name is None:
@@ -232,6 +247,8 @@ class Provider:
         }
         if composite_period is not None:
             payload["composite_period"] = str(composite_period)
+        if temporal_filter is not None:
+            payload["temporal_filter"] = list(temporal_filter)
         if _is_chunked_source(self.config.source):
             policy = self.config.selection_policy
             payload["chunking"] = {
@@ -262,6 +279,30 @@ class Provider:
         if self.config.compositor.emit_uncertainty != compositor_default.emit_uncertainty:
             return self.config.compositor.emit_uncertainty
         return self.config.emit_uncertainty
+
+
+def _normalize_temporal_filter(
+    temporal_filter: Optional[Sequence[str]],
+) -> Optional[Tuple[str, str]]:
+    if temporal_filter is None:
+        return None
+    values = tuple(str(value) for value in temporal_filter)
+    if len(values) != 2:
+        raise ValueError("temporal_filter must contain exactly two ISO date strings")
+    if values[1] < values[0]:
+        raise ValueError("temporal_filter end must not be before start")
+    return values
+
+
+def _scout_accepts_temporal_filter(source: Any) -> bool:
+    scout = getattr(source, "scout", None)
+    if not callable(scout):
+        return False
+    try:
+        parameters = inspect.signature(scout).parameters
+    except (TypeError, ValueError):
+        return False
+    return "temporal_filter" in parameters
 
 
 def _is_chunked_source(source: Any) -> bool:

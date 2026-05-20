@@ -79,6 +79,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Explicit source temporal range. Repeat as needed. Planning remains caller-owned.",
     )
     build.add_argument(
+        "--temporal-filter",
+        nargs=2,
+        metavar=("START", "END"),
+        default=None,
+        help=(
+            "Narrow the source's cached scenes to a sub-range when building. "
+            "Lets one wide --temporal-range search amortize across multiple "
+            "monthly composites."
+        ),
+    )
+    build.add_argument(
         "--sample-every-days",
         type=_positive_int,
         default=None,
@@ -240,6 +251,7 @@ def _build(args: argparse.Namespace) -> int:
     config = _provider_config(args)
     provider = Provider(config)
     band_names = tuple(args.bands or _default_bands_for(args))
+    temporal_filter = tuple(args.temporal_filter) if args.temporal_filter else None
     product = provider.build_prior(
         wgs84_bounds=args.wgs84_bounds,
         resolution=args.resolution,
@@ -248,6 +260,7 @@ def _build(args: argparse.Namespace) -> int:
         band_names=band_names,
         composite_period=args.composite_period,
         rebuild=args.rebuild,
+        temporal_filter=temporal_filter,
     )
     if args.json:
         print(json.dumps(product.stac_item, indent=2, sort_keys=True))
@@ -414,6 +427,7 @@ def _request_hash(provider: Provider, args: argparse.Namespace) -> str:
         native_crs=args.native_crs,
         band_names=tuple(args.bands or _default_bands_for(args)),
         composite_period=args.composite_period,
+        temporal_filter=tuple(args.temporal_filter) if getattr(args, "temporal_filter", None) else None,
     )
 
 

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Optional, Protocol, Sequence
+from typing import Optional, Protocol, Sequence, Tuple
 
 from surface_priors.chunks import ChunkLayout
 from surface_priors.selection import SceneChunkStats, SelectionPlan
@@ -43,8 +43,14 @@ class ChunkedObservationSource(Protocol):
         grid: GridSpec,
         layout: ChunkLayout,
         band_names: Sequence[str],
+        temporal_filter: Optional[Tuple[str, str]] = None,
     ) -> Sequence[SceneChunkStats]:
-        """Return clear/usable statistics per (scene, chunk) using cheap reads."""
+        """Return clear/usable statistics per (scene, chunk) using cheap reads.
+
+        `temporal_filter` lets callers restrict the cached scene list to a
+        sub-range (e.g., one month inside a 3-month search). Sources that
+        don't implement filtering may ignore the argument.
+        """
 
     def fetch_selected(
         self,
