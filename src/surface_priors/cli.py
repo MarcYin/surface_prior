@@ -8,12 +8,20 @@ from typing import Optional, Sequence
 from surface_priors import __version__
 from surface_priors.persistence import stac_item_path
 from surface_priors.provider import Provider, ProviderConfig
+from surface_priors.selection import SelectionPolicy
 from surface_priors.sources.earthaccess import EarthaccessSource, product_collections
 from surface_priors.sources.gee import EdownGeeSource
 from surface_priors.sources.local import LocalNpzSource
 from surface_priors.sources.rasterio_reader import NativeRasterioStackReader
+from surface_priors.sources.s2 import (
+    DEFAULT_CHUNK_SIZE,
+    DEFAULT_CLEAR_THRESHOLD,
+    DEFAULT_SCORE_BAND,
+    DEFAULT_SCOUT_FACTOR,
+)
+from surface_priors.sources.s2_gee import S2L2AGeeSource
 from surface_priors.temporal import temporal_ranges_name
-from surface_priors.types import DEFAULT_BANDS, DEFAULT_NATIVE_CRS
+from surface_priors.types import DEFAULT_BANDS, DEFAULT_NATIVE_CRS, DEFAULT_S2_L2A_BANDS
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -41,9 +49,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     build.add_argument(
         "--gee-product",
-        choices=("mcd43a1",),
+        choices=("mcd43a1", "s2_l2a"),
         default=None,
-        help="Google Earth Engine product preset fetched through edown.",
+        help="Google Earth Engine product preset. s2_l2a uses the chunked Cloud Score+ source.",
     )
     build.add_argument(
         "--gee-collection-id",
@@ -101,6 +109,48 @@ def build_parser() -> argparse.ArgumentParser:
     )
     build.add_argument("--quality-pattern", default=None, help="Rasterio quality subdataset match.")
     build.add_argument("--sample-index-pattern", default=None, help="Rasterio sample-index subdataset match.")
+    build.add_argument(
+        "--s2-score-band",
+        choices=("cs", "cs_cdf"),
+        default=DEFAULT_SCORE_BAND,
+        help="Cloud Score+ band used as quality for the S2 GEE source.",
+    )
+    build.add_argument(
+        "--s2-clear-threshold",
+        type=float,
+        default=DEFAULT_CLEAR_THRESHOLD,
+        help="Floor on Cloud Score+ values; pixels below this become nodata.",
+    )
+    build.add_argument(
+        "--s2-scout-factor",
+        type=_positive_int,
+        default=DEFAULT_SCOUT_FACTOR,
+        help="Downsampling factor for the per-scene cloud scout.",
+    )
+    build.add_argument(
+        "--chunk-size",
+        type=_positive_int,
+        default=DEFAULT_CHUNK_SIZE,
+        help="Chunk size for chunked sources. Auto-snapped to source block size when available.",
+    )
+    build.add_argument(
+        "--top-k",
+        type=_positive_int,
+        default=3,
+        help="Maximum scenes per chunk in the selection plan.",
+    )
+    build.add_argument(
+        "--min-usable-fraction",
+        type=float,
+        default=0.5,
+        help="Drop (scene, chunk) pairs with usable_fraction below this floor.",
+    )
+    build.add_argument(
+        "--fetch-workers",
+        type=_positive_int,
+        default=8,
+        help="Worker threads used for parallel chunk fetching.",
+    )
     build.add_argument("--rebuild", action="store_true", help="Ignore any cached product.")
     build.add_argument("--json", action="store_true", help="Print the STAC Item JSON.")
 
@@ -164,7 +214,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 def _build(args: argparse.Namespace) -> int:
     config = _provider_config(args)
     provider = Provider(config)
-    band_names = tuple(args.bands or DEFAULT_BANDS)
+    band_names = tuple(args.bands or _default_bands_for(args))
     product = provider.build_prior(
         wgs84_bounds=args.wgs84_bounds,
         resolution=args.resolution,
@@ -211,7 +261,16 @@ def _provider_config(args: argparse.Namespace) -> ProviderConfig:
             if args.edown_output_root
             else Path(args.cache_dir or ".surface-gee-cache") / "gee"
         )
-        if args.gee_product:
+        if args.gee_product == "s2_l2a":
+            source = S2L2AGeeSource(
+                temporal_ranges=tuple(tuple(value) for value in args.temporal_range),
+                sample_every_days=args.sample_every_days,
+                score_band=args.s2_score_band,
+                clear_threshold=args.s2_clear_threshold,
+                scout_factor=args.s2_scout_factor,
+                chunk_size=args.chunk_size,
+            )
+        elif args.gee_product:
             source = EdownGeeSource.for_product(
                 args.gee_product,
                 temporal_ranges=tuple(tuple(value) for value in args.temporal_range),
@@ -263,7 +322,19 @@ def _provider_config(args: argparse.Namespace) -> ProviderConfig:
         cache_dir=args.cache_dir or Path.home() / ".cache" / "surface-priors",
         source=source,
         source_name=getattr(args, "source_name", None),
+        chunk_size=getattr(args, "chunk_size", 512),
+        selection_policy=SelectionPolicy(
+            top_k=getattr(args, "top_k", 3),
+            min_usable_fraction=getattr(args, "min_usable_fraction", 0.5),
+        ),
+        fetch_workers=getattr(args, "fetch_workers", 8),
     )
+
+
+def _default_bands_for(args: argparse.Namespace) -> Sequence[str]:
+    if getattr(args, "gee_product", None) == "s2_l2a":
+        return DEFAULT_S2_L2A_BANDS
+    return DEFAULT_BANDS
 
 
 def _parse_band_patterns(values: Sequence[str]) -> dict[str, str]:
@@ -296,7 +367,7 @@ def _request_hash(provider: Provider, args: argparse.Namespace) -> str:
         resolution=args.resolution,
         product_id=args.product_id,
         native_crs=args.native_crs,
-        band_names=tuple(args.bands or DEFAULT_BANDS),
+        band_names=tuple(args.bands or _default_bands_for(args)),
         composite_period=args.composite_period,
     )
 

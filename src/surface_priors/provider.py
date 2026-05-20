@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import inspect
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence, Union
 
-from surface_priors.composite import PriorCompositor
+from surface_priors.chunks import ChunkLayout
+from surface_priors.composite import ChunkedCompositor, PriorCompositor
 from surface_priors.persistence import CompositeStore, stable_json_hash
+from surface_priors.selection import SelectionPlan, SelectionPolicy, select
 from surface_priors.sources.base import ObservationSource
 from surface_priors.types import (
     DEFAULT_BANDS,
@@ -30,6 +33,9 @@ class ProviderConfig:
     source_name: Optional[str] = None
     compositor: PriorCompositor = field(default_factory=PriorCompositor)
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    chunk_size: int = 512
+    selection_policy: SelectionPolicy = field(default_factory=SelectionPolicy)
+    fetch_workers: int = 8
 
 
 class Provider:
@@ -70,25 +76,80 @@ class Provider:
         if not rebuild and self.store.has_product(request_hash):
             return self.store.load(request_hash, request={**request, "request_hash": request_hash})
 
-        if observations is None:
-            if self.config.source is None:
-                stac_path = self.store.product_dir(request_hash) / "stac-item.json"
-                raise RuntimeError(
-                    "cache miss and no observations or ObservationSource configured. "
-                    f"Configure ProviderConfig(source=...), pass observations=..., or create {stac_path} first."
+        if observations is None and _is_chunked_source(self.config.source):
+            composite = self._build_chunked(
+                product_id=product_id,
+                grid=grid,
+                band_names=band_names,
+            )
+        else:
+            if observations is None:
+                if self.config.source is None:
+                    stac_path = self.store.product_dir(request_hash) / "stac-item.json"
+                    raise RuntimeError(
+                        "cache miss and no observations or ObservationSource configured. "
+                        f"Configure ProviderConfig(source=...), pass observations=..., or create {stac_path} first."
+                    )
+                observations = self.config.source.load_observations(
+                    grid=grid, band_names=band_names
                 )
-            observations = self.config.source.load_observations(grid=grid, band_names=band_names)
-
-        composite = self.config.compositor.compose(
-            product_id=product_id,
-            grid=grid,
-            band_names=band_names,
-            observations=observations,
-        )
+            composite = self.config.compositor.compose(
+                product_id=product_id,
+                grid=grid,
+                band_names=band_names,
+                observations=observations,
+            )
         return self.store.save(
             request_hash=request_hash,
             request=request,
             composite=composite,
+        )
+
+    def _build_chunked(
+        self,
+        *,
+        product_id: str,
+        grid: GridSpec,
+        band_names: Sequence[str],
+    ):
+        source = self.config.source
+        assert source is not None
+        block_size_fn = getattr(source, "block_size", None)
+        block_size = None
+        if callable(block_size_fn):
+            block_size = block_size_fn(grid=grid, band_names=band_names)
+        layout = ChunkLayout.from_grid(
+            grid,
+            chunk_size=self.config.chunk_size,
+            block_size=block_size,
+        )
+        stats = source.scout(grid=grid, layout=layout, band_names=band_names)
+        plan = select(
+            layout=layout,
+            stats=stats,
+            policy=self.config.selection_policy,
+        )
+        cache = _prefetch_chunks(
+            source=source,
+            grid=grid,
+            plan=plan,
+            band_names=band_names,
+            workers=self.config.fetch_workers,
+        )
+
+        def chunk_loader(scene_index: int, chunk_id: int) -> Optional[Observation]:
+            return cache.get((int(scene_index), int(chunk_id)))
+
+        compositor = ChunkedCompositor(
+            quality_rules=self.config.compositor.quality_rules,
+            output_dtype=self.config.compositor.output_dtype,
+        )
+        return compositor.compose(
+            product_id=product_id,
+            grid=grid,
+            band_names=band_names,
+            plan=plan,
+            chunk_loader=chunk_loader,
         )
 
     def request_hash(
@@ -168,9 +229,62 @@ class Provider:
         }
         if composite_period is not None:
             payload["composite_period"] = str(composite_period)
+        if _is_chunked_source(self.config.source):
+            policy = self.config.selection_policy
+            payload["chunking"] = {
+                "chunk_size": int(self.config.chunk_size),
+                "top_k": int(policy.top_k),
+                "min_usable_fraction": float(policy.min_usable_fraction),
+                "min_clear_score": float(policy.min_clear_score),
+            }
         return payload
 
     get_prior = build_prior
+
+
+def _is_chunked_source(source: Any) -> bool:
+    if source is None:
+        return False
+    return callable(getattr(source, "scout", None)) and callable(
+        getattr(source, "fetch_selected", None)
+    )
+
+
+def _prefetch_chunks(
+    *,
+    source: Any,
+    grid: GridSpec,
+    plan: SelectionPlan,
+    band_names: Sequence[str],
+    workers: int,
+) -> dict[tuple[int, int], Optional[Observation]]:
+    tasks: list[tuple[int, int]] = []
+    for chunk_id, scenes in plan.selected.items():
+        for scene_index in scenes:
+            tasks.append((int(scene_index), int(chunk_id)))
+    if not tasks:
+        return {}
+
+    def fetch(item: tuple[int, int]) -> tuple[tuple[int, int], Optional[Observation]]:
+        scene_index, chunk_id = item
+        return item, source.fetch_selected(
+            grid=grid,
+            plan=plan,
+            band_names=band_names,
+            scene_index=scene_index,
+            chunk_id=chunk_id,
+        )
+
+    cache: dict[tuple[int, int], Optional[Observation]] = {}
+    if workers <= 1:
+        for task in tasks:
+            key, value = fetch(task)
+            cache[key] = value
+        return cache
+    with ThreadPoolExecutor(max_workers=int(workers)) as pool:
+        for key, value in pool.map(fetch, tasks):
+            cache[key] = value
+    return cache
 
 
 def _native_crs_parameter_name(resolver: Any) -> str:

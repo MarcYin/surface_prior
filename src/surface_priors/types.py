@@ -37,6 +37,20 @@ DEFAULT_BANDS = (
     "brdf_vol_swir2",
     "brdf_geo_swir2",
 )
+DEFAULT_S2_L2A_BANDS = (
+    "s2_b01_aerosol",
+    "s2_b02_blue",
+    "s2_b03_green",
+    "s2_b04_red",
+    "s2_b05_re1",
+    "s2_b06_re2",
+    "s2_b07_re3",
+    "s2_b08_nir",
+    "s2_b8a_nir_narrow",
+    "s2_b09_water_vapor",
+    "s2_b11_swir1",
+    "s2_b12_swir2",
+)
 
 
 def utc_now_iso() -> str:

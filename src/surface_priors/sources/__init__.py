@@ -9,6 +9,7 @@ from surface_priors.sources.gee import (
     gee_product_preset,
 )
 from surface_priors.sources.local import InMemorySource, LocalNpzSource
+from surface_priors.sources.s2_gee import S2L2AGeeSource
 
 __all__ = [
     "ChunkedObservationSource",
@@ -19,5 +20,6 @@ __all__ = [
     "InMemorySource",
     "LocalNpzSource",
     "ObservationSource",
+    "S2L2AGeeSource",
     "gee_product_preset",
 ]
