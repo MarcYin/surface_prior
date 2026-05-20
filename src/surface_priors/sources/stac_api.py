@@ -541,9 +541,8 @@ class StacApiSource:
             opener = rasterio.open
         env = self._env_context()
         try:
-            with env:
-                with opener(href) as dataset:
-                    return _read_to_grid(dataset, grid=grid, resample=resample)
+            with env, opener(href) as dataset:
+                return _read_to_grid(dataset, grid=grid, resample=resample)
         except (OSError, RuntimeError):
             return None
 

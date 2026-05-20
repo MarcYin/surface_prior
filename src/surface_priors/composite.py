@@ -13,10 +13,20 @@ from surface_priors.types import GridSpec, Observation, PriorComposite
 
 @dataclass(frozen=True)
 class PriorCompositor:
-    """Build a best-pixel surface prior from native-grid observations."""
+    """Build a best-pixel surface prior from native-grid observations.
+
+    The composite picks the highest-scoring single observation per pixel, so
+    the stack-wide std around that winner is not a coherent uncertainty
+    estimate (it mixes inter-acquisition variability with contamination
+    from the rejected scenes). When `emit_uncertainty=False` the stack-std
+    fallback is skipped; pixels without a per-observation uncertainty are
+    left as NaN and become nodata on persistence. Set `emit_uncertainty=True`
+    if downstream consumers expect the empirical std even with its caveats.
+    """
 
     quality_rules: QualityRules = field(default_factory=QualityRules)
     output_dtype: str = "float32"
+    emit_uncertainty: bool = False
 
     def compose(
         self,
@@ -75,14 +85,17 @@ class PriorCompositor:
                 }
             )
 
-        missing_uncertainty = ~np.isfinite(best_uncertainty)
-        if np.any(missing_uncertainty):
-            fallback_uncertainty = relative_uncertainty_from_stack(
-                data_stack=tuple(data_stack),
-                valid_stack=tuple(valid_stack),
-                reference=best_data,
-            )
-            best_uncertainty = np.where(missing_uncertainty, fallback_uncertainty, best_uncertainty)
+        if self.emit_uncertainty:
+            missing_uncertainty = ~np.isfinite(best_uncertainty)
+            if np.any(missing_uncertainty):
+                fallback_uncertainty = relative_uncertainty_from_stack(
+                    data_stack=tuple(data_stack),
+                    valid_stack=tuple(valid_stack),
+                    reference=best_data,
+                )
+                best_uncertainty = np.where(
+                    missing_uncertainty, fallback_uncertainty, best_uncertainty
+                )
 
         return PriorComposite(
             product_id=product_id,
@@ -155,6 +168,7 @@ class ChunkedCompositor:
 
     quality_rules: QualityRules = field(default_factory=QualityRules)
     output_dtype: str = "float32"
+    emit_uncertainty: bool = False
 
     def compose(
         self,
@@ -185,6 +199,7 @@ class ChunkedCompositor:
         inner = PriorCompositor(
             quality_rules=self.quality_rules,
             output_dtype=self.output_dtype,
+            emit_uncertainty=self.emit_uncertainty,
         )
 
         for window in layout:

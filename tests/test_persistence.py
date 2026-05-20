@@ -95,3 +95,40 @@ def test_store_writes_tiled_deflate_geotiffs_and_stac_item(tmp_path):
     assert loaded.composite.data.shape == (2, 2, 2)
     np.testing.assert_allclose(loaded.composite.data[1], [[0.4, 0.5], [0.6, 0.7]])
     np.testing.assert_allclose(loaded.composite.uncertainty[1], [[0, 50], [100, 150]])
+
+
+def test_store_skips_uncertainty_when_composite_has_no_finite_values(tmp_path):
+    grid = GridSpec.from_bounds((0, 0, 2, 2), "EPSG:4326", 1)
+    composite = PriorComposite(
+        product_id="no-uncertainty",
+        grid=grid,
+        band_names=("iso",),
+        data=np.array([[[0.1, 0.2], [0.3, 0.4]]], dtype="float32"),
+        uncertainty=np.full((1, 2, 2), np.nan, dtype="float32"),
+        quality=np.zeros((2, 2), dtype="uint16"),
+        sample_index=np.zeros((2, 2), dtype="int16"),
+        selected_observation=np.zeros((2, 2), dtype="int16"),
+        observation_count=np.ones((2, 2), dtype="uint16"),
+    )
+    request = {
+        "product_id": "no-uncertainty",
+        "wgs84_bounds": [0, 0, 2, 2],
+        "native_bounds": [0, 0, 2, 2],
+        "native_crs": "EPSG:4326",
+    }
+    request_hash = stable_json_hash(request)
+
+    store = CompositeStore(tmp_path)
+    product = store.save(request_hash=request_hash, request=request, composite=composite)
+
+    # No uncertainty directory and no uncertainty assets in the STAC item.
+    uncertainty_root = tmp_path / request_hash / "assets" / "uncertainty"
+    assert not uncertainty_root.exists()
+    assert all(
+        not key.startswith("uncertainty_") for key in product.stac_item["assets"]
+    )
+
+    # Round-trip via store.load — uncertainty array must come back as all-NaN.
+    loaded = store.load(request_hash, request=request)
+    assert loaded.composite.uncertainty.shape == (1, 2, 2)
+    assert np.isnan(loaded.composite.uncertainty).all()

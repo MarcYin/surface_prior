@@ -25,8 +25,10 @@ def build_stac_item(
 ) -> Dict[str, Any]:
     if len(prior_hrefs) != len(composite.band_names):
         raise ValueError("prior_hrefs length must match composite band count")
-    if len(uncertainty_hrefs) != len(composite.band_names):
-        raise ValueError("uncertainty_hrefs length must match composite band count")
+    if uncertainty_hrefs and len(uncertainty_hrefs) != len(composite.band_names):
+        raise ValueError(
+            "uncertainty_hrefs must be empty or match composite band count"
+        )
     grid = composite.grid
     if composite_period is None:
         composite_period = composite.attrs.get("composite_period")
@@ -102,6 +104,7 @@ def _band_assets(
     composite_period: Optional[str],
 ) -> Dict[str, Any]:
     assets: Dict[str, Any] = {}
+    include_uncertainty = bool(uncertainty_hrefs)
     for index, band_name in enumerate(band_names):
         key_suffix = asset_stem(band_name)
         assets[f"prior_{key_suffix}"] = _prior_asset(
@@ -110,12 +113,13 @@ def _band_assets(
             band_index=index,
             composite_period=composite_period,
         )
-        assets[f"uncertainty_{key_suffix}"] = _uncertainty_asset(
-            uncertainty_hrefs[index],
-            band_name=band_name,
-            band_index=index,
-            composite_period=composite_period,
-        )
+        if include_uncertainty:
+            assets[f"uncertainty_{key_suffix}"] = _uncertainty_asset(
+                uncertainty_hrefs[index],
+                band_name=band_name,
+                band_index=index,
+                composite_period=composite_period,
+            )
     return assets
 
 

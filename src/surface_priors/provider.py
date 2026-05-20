@@ -36,6 +36,7 @@ class ProviderConfig:
     chunk_size: int = 512
     selection_policy: SelectionPolicy = field(default_factory=SelectionPolicy)
     fetch_workers: int = 8
+    emit_uncertainty: bool = False
 
 
 class Provider:
@@ -93,7 +94,8 @@ class Provider:
                 observations = self.config.source.load_observations(
                     grid=grid, band_names=band_names
                 )
-            composite = self.config.compositor.compose(
+            compositor = self._eager_compositor()
+            composite = compositor.compose(
                 product_id=product_id,
                 grid=grid,
                 band_names=band_names,
@@ -143,6 +145,7 @@ class Provider:
         compositor = ChunkedCompositor(
             quality_rules=self.config.compositor.quality_rules,
             output_dtype=self.config.compositor.output_dtype,
+            emit_uncertainty=self._resolved_emit_uncertainty(),
         )
         return compositor.compose(
             product_id=product_id,
@@ -240,6 +243,25 @@ class Provider:
         return payload
 
     get_prior = build_prior
+
+    def _eager_compositor(self) -> PriorCompositor:
+        base = self.config.compositor
+        emit = self._resolved_emit_uncertainty()
+        if base.emit_uncertainty == emit:
+            return base
+        return PriorCompositor(
+            quality_rules=base.quality_rules,
+            output_dtype=base.output_dtype,
+            emit_uncertainty=emit,
+        )
+
+    def _resolved_emit_uncertainty(self) -> bool:
+        # The compositor field's value wins when callers handed in a fully
+        # configured compositor; otherwise the top-level ProviderConfig flag.
+        compositor_default = PriorCompositor()
+        if self.config.compositor.emit_uncertainty != compositor_default.emit_uncertainty:
+            return self.config.compositor.emit_uncertainty
+        return self.config.emit_uncertainty
 
 
 def _is_chunked_source(source: Any) -> bool:

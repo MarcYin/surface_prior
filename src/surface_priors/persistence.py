@@ -62,10 +62,13 @@ class CompositeStore:
         if assets_dir.exists():
             shutil.rmtree(assets_dir)
         composite_period = _composite_period(request, composite)
+        write_uncertainty = bool(np.any(np.isfinite(composite.uncertainty)))
         prior_dir = _asset_kind_dir(assets_dir, "prior", composite_period)
-        uncertainty_dir = _asset_kind_dir(assets_dir, "uncertainty", composite_period)
         prior_dir.mkdir(parents=True, exist_ok=True)
-        uncertainty_dir.mkdir(parents=True, exist_ok=True)
+        uncertainty_dir = None
+        if write_uncertainty:
+            uncertainty_dir = _asset_kind_dir(assets_dir, "uncertainty", composite_period)
+            uncertainty_dir.mkdir(parents=True, exist_ok=True)
         _validate_unique_asset_stems(composite.band_names)
         if composite_period is not None and composite.attrs.get("composite_period") != composite_period:
             composite = replace(
@@ -73,7 +76,7 @@ class CompositeStore:
                 attrs={**dict(composite.attrs), "composite_period": composite_period},
             )
         prior_hrefs = []
-        uncertainty_hrefs = []
+        uncertainty_hrefs: list[str] = []
         for band_index, band_name in enumerate(composite.band_names):
             filename = f"{asset_stem(band_name)}.tif"
             prior_path = write_prior_band_geotiff(
@@ -81,13 +84,14 @@ class CompositeStore:
                 composite=composite,
                 band_index=band_index,
             )
-            uncertainty_path = write_uncertainty_band_geotiff(
-                uncertainty_dir / filename,
-                composite=composite,
-                band_index=band_index,
-            )
             prior_hrefs.append(normalize_href(prior_path, destination))
-            uncertainty_hrefs.append(normalize_href(uncertainty_path, destination))
+            if write_uncertainty and uncertainty_dir is not None:
+                uncertainty_path = write_uncertainty_band_geotiff(
+                    uncertainty_dir / filename,
+                    composite=composite,
+                    band_index=band_index,
+                )
+                uncertainty_hrefs.append(normalize_href(uncertainty_path, destination))
         created_at = utc_now_iso()
         stac_item = build_stac_item(
             composite=composite,
@@ -148,18 +152,20 @@ def load_product(path: Union[str, Path], request: Optional[Mapping[str, Any]] = 
         kind="prior",
         band_names=band_names,
     )
-    uncertainty_encoded, uncertainty_grid = _read_single_band_stack(
-        rasterio,
-        source=source,
-        stac_item=stac_item,
-        kind="uncertainty",
-        band_names=band_names,
-    )
-    if uncertainty_grid.to_dict() != grid.to_dict():
-        raise ValueError("uncertainty assets do not share the prior asset grid")
-
     data = decode_prior(prior_encoded)
-    uncertainty = decode_relative_uncertainty(uncertainty_encoded)
+    if _stac_has_assets(stac_item, kind="uncertainty"):
+        uncertainty_encoded, uncertainty_grid = _read_single_band_stack(
+            rasterio,
+            source=source,
+            stac_item=stac_item,
+            kind="uncertainty",
+            band_names=band_names,
+        )
+        if uncertainty_grid.to_dict() != grid.to_dict():
+            raise ValueError("uncertainty assets do not share the prior asset grid")
+        uncertainty = decode_relative_uncertainty(uncertainty_encoded)
+    else:
+        uncertainty = np.full(data.shape, np.nan, dtype="float32")
     shape = grid.shape
     attrs = dict(stac_item["properties"].get("surface:attrs", {}))
     composite_period = stac_item["properties"].get("surface:composite_period")
@@ -188,6 +194,13 @@ def load_product(path: Union[str, Path], request: Optional[Mapping[str, Any]] = 
         output_dir=str(source),
         package_version=stac_item["properties"].get("surface:package_version", "unknown"),
     )
+
+
+def _stac_has_assets(stac_item: Mapping[str, Any], *, kind: str) -> bool:
+    for asset in stac_item.get("assets", {}).values():
+        if asset.get("surface:asset_kind") == kind:
+            return True
+    return False
 
 
 def _read_single_band_stack(

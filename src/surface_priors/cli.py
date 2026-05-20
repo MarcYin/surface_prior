@@ -163,6 +163,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=8,
         help="Worker threads used for parallel chunk fetching.",
     )
+    build.add_argument(
+        "--with-uncertainty",
+        action="store_true",
+        help=(
+            "Emit the stack-std uncertainty fallback. Disabled by default because "
+            "best-pixel composites pick a single winner per pixel, so the std around "
+            "that winner is not a coherent uncertainty estimate."
+        ),
+    )
     build.add_argument("--rebuild", action="store_true", help="Ignore any cached product.")
     build.add_argument("--json", action="store_true", help="Print the STAC Item JSON.")
 
@@ -357,6 +366,7 @@ def _provider_config(args: argparse.Namespace) -> ProviderConfig:
             min_usable_fraction=getattr(args, "min_usable_fraction", 0.5),
         ),
         fetch_workers=getattr(args, "fetch_workers", 8),
+        emit_uncertainty=bool(getattr(args, "with_uncertainty", False)),
     )
 
 
