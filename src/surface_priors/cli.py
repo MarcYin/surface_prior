@@ -161,7 +161,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--fetch-workers",
         type=_positive_int,
         default=8,
-        help="Worker threads used for parallel chunk fetching.",
+        help=(
+            "Outer worker threads used for parallel chunk fetching. STAC sources "
+            "multiply this by band_workers (default 12) for total concurrent HTTP "
+            "calls; keep the product ≤100 to avoid Element84 rate limits."
+        ),
     )
     build.add_argument(
         "--with-uncertainty",

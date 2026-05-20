@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import shutil
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Mapping, Optional, Union
@@ -33,8 +34,18 @@ def stable_json_hash(payload: Mapping[str, Any]) -> str:
 class CompositeStore:
     """File-system store for STAC Item surface prior products."""
 
-    def __init__(self, root: Union[str, Path]):
+    DEFAULT_WRITE_WORKERS = 8
+
+    def __init__(
+        self,
+        root: Union[str, Path],
+        *,
+        write_workers: Optional[int] = None,
+    ):
         self.root = Path(root).expanduser().resolve()
+        self.write_workers = (
+            int(write_workers) if write_workers is not None else self.DEFAULT_WRITE_WORKERS
+        )
 
     def product_dir(self, request_hash: str) -> Path:
         return self.root / request_hash
@@ -75,23 +86,48 @@ class CompositeStore:
                 composite,
                 attrs={**dict(composite.attrs), "composite_period": composite_period},
             )
-        prior_hrefs = []
-        uncertainty_hrefs: list[str] = []
-        for band_index, band_name in enumerate(composite.band_names):
+        band_count = len(composite.band_names)
+        prior_results: list[Optional[str]] = [None] * band_count
+        uncertainty_results: list[Optional[str]] = [None] * band_count
+
+        def write_prior(band_index: int) -> None:
+            band_name = composite.band_names[band_index]
             filename = f"{asset_stem(band_name)}.tif"
-            prior_path = write_prior_band_geotiff(
+            path = write_prior_band_geotiff(
                 prior_dir / filename,
                 composite=composite,
                 band_index=band_index,
             )
-            prior_hrefs.append(normalize_href(prior_path, destination))
-            if write_uncertainty and uncertainty_dir is not None:
-                uncertainty_path = write_uncertainty_band_geotiff(
-                    uncertainty_dir / filename,
-                    composite=composite,
-                    band_index=band_index,
-                )
-                uncertainty_hrefs.append(normalize_href(uncertainty_path, destination))
+            prior_results[band_index] = normalize_href(path, destination)
+
+        def write_uncertainty_band(band_index: int) -> None:
+            assert uncertainty_dir is not None
+            band_name = composite.band_names[band_index]
+            filename = f"{asset_stem(band_name)}.tif"
+            path = write_uncertainty_band_geotiff(
+                uncertainty_dir / filename,
+                composite=composite,
+                band_index=band_index,
+            )
+            uncertainty_results[band_index] = normalize_href(path, destination)
+
+        write_jobs: list = [(write_prior, i) for i in range(band_count)]
+        if write_uncertainty and uncertainty_dir is not None:
+            write_jobs.extend((write_uncertainty_band, i) for i in range(band_count))
+
+        if self.write_workers <= 1 or len(write_jobs) <= 1:
+            for fn, idx in write_jobs:
+                fn(idx)
+        else:
+            with ThreadPoolExecutor(max_workers=self.write_workers) as pool:
+                list(pool.map(lambda job: job[0](job[1]), write_jobs))
+
+        prior_hrefs = [href for href in prior_results if href is not None]
+        uncertainty_hrefs = (
+            [href for href in uncertainty_results if href is not None]
+            if write_uncertainty
+            else []
+        )
         created_at = utc_now_iso()
         stac_item = build_stac_item(
             composite=composite,

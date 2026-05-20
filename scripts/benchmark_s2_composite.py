@@ -34,12 +34,8 @@ from surface_priors.chunks import ChunkLayout  # noqa: E402
 from surface_priors.composite import ChunkedCompositor  # noqa: E402
 from surface_priors.provider import Provider, ProviderConfig  # noqa: E402
 from surface_priors.selection import SceneChunkStats, SelectionPolicy, select  # noqa: E402
-from surface_priors.sources.stac_api import (  # noqa: E402
-    EARTH_SEARCH_S2_ALIASES,
-    NoOpSigner,
-    StacApiSource,
-)
-from surface_priors.types import GridSpec, Observation, DEFAULT_S2_L2A_BANDS  # noqa: E402
+from surface_priors.sources.stac_api import StacApiSource  # noqa: E402
+from surface_priors.types import DEFAULT_S2_L2A_BANDS, GridSpec, Observation  # noqa: E402
 
 
 @dataclass
@@ -155,11 +151,14 @@ def run_real(
     cache_dir: Path,
     top_k: int,
     min_usable_fraction: float,
+    scout_workers: int,
+    band_workers: int,
 ) -> PhaseTimings:
     source = StacApiSource.earth_search_s2_l2a(
         temporal_ranges=(temporal_range,),
         chunk_size=chunk_size,
-        scout_workers=fetch_workers,
+        scout_workers=scout_workers,
+        band_workers=band_workers,
     )
     config = ProviderConfig(
         cache_dir=cache_dir,
@@ -354,7 +353,7 @@ def run_synthetic(
         return cache.get((int(scene_index), int(chunk_id)))
 
     compositor = ChunkedCompositor()
-    composite = compositor.compose(
+    compositor.compose(
         product_id="synthetic",
         grid=grid,
         band_names=bands,
@@ -382,6 +381,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--top-k", type=int, default=3)
     parser.add_argument("--min-usable-fraction", type=float, default=0.5)
     parser.add_argument("--fetch-workers", type=int, default=8)
+    parser.add_argument("--scout-workers", type=int, default=16)
+    parser.add_argument("--band-workers", type=int, default=12)
     parser.add_argument("--cache-dir", type=Path, default=Path(".benchmark-cache"))
     parser.add_argument(
         "--bands",
@@ -408,6 +409,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             cache_dir=args.cache_dir,
             top_k=args.top_k,
             min_usable_fraction=args.min_usable_fraction,
+            scout_workers=args.scout_workers,
+            band_workers=args.band_workers,
         )
     else:
         timings = run_synthetic(

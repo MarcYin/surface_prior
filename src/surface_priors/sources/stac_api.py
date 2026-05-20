@@ -212,7 +212,8 @@ class StacApiSource:
         scout_factor: int = DEFAULT_SCOUT_FACTOR,
         chunk_size: int = DEFAULT_CHUNK_SIZE,
         max_scenes: Optional[int] = None,
-        scout_workers: int = 4,
+        scout_workers: int = 16,
+        band_workers: int = 12,
         name: Optional[str] = None,
         stac_client: Any = None,
         opener: Any = None,
@@ -238,6 +239,7 @@ class StacApiSource:
         self.chunk_size = int(chunk_size)
         self.max_scenes = None if max_scenes is None else int(max_scenes)
         self.scout_workers = max(1, int(scout_workers))
+        self.band_workers = max(1, int(band_workers))
         self._stac_client = stac_client
         self._opener = opener  # injected rasterio.open replacement for tests
         self.gdal_env: Mapping[str, str] = dict(gdal_env) if gdal_env is not None else dict(
@@ -451,26 +453,57 @@ class StacApiSource:
             return None
         window = plan.layout[chunk_id]
         sub_grid = chunk_grid(grid, window)
-        band_arrays = []
+
+        # Pre-validate that every requested SR band has an asset on this scene
+        # so we can fail fast before launching reads.
+        sr_assets = []
         for band in band_names:
             sr_asset = self.aliases.band_to_asset.get(band)
             if sr_asset is None or sr_asset not in scene.asset_hrefs:
                 return None
+            sr_assets.append(sr_asset)
+
+        def read_sr(index_band):
+            index, sr_asset = index_band
             arr = self._read_window(
                 href=scene.asset_hrefs[sr_asset],
                 grid=sub_grid,
                 resample="bilinear",
             )
             if arr is None:
-                return None
+                return index, None
             arr = arr.astype("float32", copy=False) * float(self.aliases.sr_scale)
-            band_arrays.append(apply_zero_as_nodata(arr))
-        data = np.stack(band_arrays, axis=0).astype("float32", copy=False)
+            return index, apply_zero_as_nodata(arr)
 
-        quality = self._read_quality_window(scene=scene, sub_grid=sub_grid)
+        def read_quality(_):
+            return -1, self._read_quality_window(scene=scene, sub_grid=sub_grid)
+
+        results: dict[int, Optional[np.ndarray]] = {}
+        if self.band_workers <= 1:
+            for index, sr_asset in enumerate(sr_assets):
+                results[index] = read_sr((index, sr_asset))[1]
+            results[-1] = self._read_quality_window(scene=scene, sub_grid=sub_grid)
+        else:
+            with ThreadPoolExecutor(max_workers=self.band_workers) as pool:
+                futures = []
+                for index, sr_asset in enumerate(sr_assets):
+                    futures.append(pool.submit(read_sr, (index, sr_asset)))
+                futures.append(pool.submit(read_quality, None))
+                for future in futures:
+                    index, arr = future.result()
+                    results[index] = arr
+
+        band_arrays = []
+        for index in range(len(band_names)):
+            arr = results.get(index)
+            if arr is None:
+                return None
+            band_arrays.append(arr)
+        quality = results.get(-1)
         if quality is None:
             return None
 
+        data = np.stack(band_arrays, axis=0).astype("float32", copy=False)
         return Observation(
             data=data,
             quality=quality,
