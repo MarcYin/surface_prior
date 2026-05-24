@@ -3,7 +3,6 @@
 Runs a tiny single-month composite at 60 m and checks that we get
 back numpy arrays with the expected dtype/shape — no GeoTIFF writes.
 """
-import os
 import time
 
 import numpy as np

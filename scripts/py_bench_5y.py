@@ -8,12 +8,8 @@ Runs sequentially and in parallel (threads). GIL is released inside
 build_composite via py.allow_threads(), so the 5 calls truly overlap.
 """
 import argparse
-import os
 import time
-from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
-
-import surface_priors_rs as spx
-
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
 BBOX = (30.5, 30.5, 31.6, 31.5)
 YEARS = (2020, 2021, 2022, 2023, 2024)
