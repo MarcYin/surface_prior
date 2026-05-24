@@ -39,6 +39,13 @@ jobs:
       # container before maturin runs cargo.
       - name: Build wheel
         uses: PyO3/maturin-action@v1
+        env:
+          # PyO3 0.22 was released before CPython 3.14. The wheel is
+          # built against abi3-py39, which CPython guarantees stays
+          # binary-compatible across 3.x releases. This flag tells
+          # PyO3 not to refuse compilation if it sees a newer Python
+          # in the build environment than it natively recognises.
+          PYO3_USE_ABI3_FORWARD_COMPATIBILITY: "1"
         with:
           working-directory: surface_priors_rs
           target: ${{ matrix.target }}

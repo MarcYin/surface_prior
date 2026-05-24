@@ -27,6 +27,12 @@ Computer, on a single 16-core Zen 4 node:
 
 The 5-way parallel floor is set by network throughput to PC, not CPU.
 
+## Python support
+
+Built as an [abi3](https://docs.python.org/3/c-api/stable.html) wheel
+against the Python 3.9 stable ABI, so a single wheel installs and
+runs on CPython 3.9, 3.10, 3.11, 3.12, 3.13, and 3.14.
+
 ## Use from Python
 
 Install from a prebuilt wheel (attached to GitHub Releases):
