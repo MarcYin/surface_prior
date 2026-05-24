@@ -59,6 +59,45 @@ Planned extension point:
 
 - Direct surface reflectance prior sources such as Sentinel-2 or Landsat, provided they can deliver observations aligned to the requested native grid.
 
+## Sentinel-2 L2A composites (Rust)
+
+The `surface_priors_rs/` directory in this repo contains a separately
+distributed Rust crate, **`surface-priors-rs`**, that builds Sentinel-2
+L2A best-pixel monthly composites end-to-end (STAC search → MGRS
+tile-aware selection → COG fetch → resample → compose) and exposes them
+to Python as numpy arrays — no GeoTIFF writes required.
+
+On a 16-core node from JASMIN it produces 5 years × 1 month over a
+100 × 100 km AOI at 60 m in about **6 seconds** parallel or **11
+seconds** sequential, network-bound against Planetary Computer.
+
+```python
+import surface_priors_rs as spx
+
+out = spx.build_composite(
+    bbox=(30.5, 30.5, 31.6, 31.5),
+    datetime="2024-07-01/2024-07-31",
+    resolution=60.0,
+    top_k=3,
+    endpoint="pc",
+    bands=["coastal", "blue", "green", "red", "nir", "swir16", "swir22"],
+)
+
+red = out["bands"]["red"]      # uint16 ndarray (H, W)
+quality = out["quality"]       # 0=clear, 1=marginal, 2=dark, 65535=nodata
+print(out["grid"])             # bounds, epsg, transform
+```
+
+Install from a prebuilt wheel attached to a GitHub Release (one abi3
+wheel covers Python 3.9 through 3.14):
+
+```bash
+pip install <wheel-url-from-rs-v*-release>
+```
+
+See [`surface_priors_rs/README.md`](surface_priors_rs/README.md) for
+the full API, CLI usage, architecture, and benchmark details.
+
 This package owns:
 
 - WGS84 AOI bounds conversion into the native prior data CRS.

@@ -43,3 +43,29 @@ temporal input policy.
 Input AOI bounds are always WGS84 `(west, south, east, north)`. The package converts them to the configured native CRS internally; the current BRDF default is MODIS/VIIRS Sinusoidal.
 
 Sources that can resolve their native grid, such as the `edown` Google Earth Engine source, may replace that fallback grid with the exact downloaded GeoTIFF grid. The compositor still receives native-grid arrays and does not reproject them.
+
+## Sentinel-2 L2A composites (Rust)
+
+The repository also ships a separate Rust crate, **`surface-priors-rs`**,
+that produces Sentinel-2 L2A best-pixel monthly composites and returns
+them to Python as numpy arrays. On a 16-core node it builds 5 years × 1
+month over a 100 × 100 km AOI at 60 m in roughly 6 seconds, network-bound
+against Planetary Computer.
+
+```python
+import surface_priors_rs as spx
+
+out = spx.build_composite(
+    bbox=(30.5, 30.5, 31.6, 31.5),
+    datetime="2024-07-01/2024-07-31",
+    resolution=60.0,
+    top_k=3,
+    endpoint="pc",
+)
+red = out["bands"]["red"]   # uint16 ndarray (H, W)
+```
+
+Source and full docs live under
+[`surface_priors_rs/`](https://github.com/MarcYin/surface_prior/tree/main/surface_priors_rs)
+in the repo. Wheels for CPython 3.9–3.14 are attached to each GitHub
+Release tagged `rs-v*`.
