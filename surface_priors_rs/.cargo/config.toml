@@ -1,0 +1,5 @@
+[build]
+# Compile for the host's full instruction set (AVX2, FMA, etc) on
+# release builds. The binary won't be portable to older CPUs but the
+# resampler and predictor benefit from AVX2/FMA when available.
+rustflags = ["-C", "target-cpu=native"]

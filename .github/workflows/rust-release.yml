@@ -1,0 +1,102 @@
+name: Rust crate release
+
+# Trigger on `rs-v*` tags so this stays distinct from the existing
+# Python `v*` tags that drive the surface-priors PyPI publish.
+on:
+  push:
+    tags: ["rs-v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag name to attach the release to (e.g. rs-v0.1.0)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build wheel (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Primary target: portable manylinux_2_28 x86_64. Requires
+          # AVX2/FMA at runtime (Haswell+ / Zen+) because the resampler
+          # uses hand-rolled AVX2 intrinsics in the hot path.
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            manylinux: "2_28"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # PROJ is needed by proj-sys; install inside the manylinux build
+      # container before maturin runs cargo.
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          working-directory: surface_priors_rs
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          args: --release --features python --out dist
+          before-script-linux: |
+            # manylinux_2_28 is AlmaLinux 8 / RHEL 8 based.
+            dnf install -y epel-release
+            dnf install -y proj-devel sqlite-devel clang
+          rust-toolchain: stable
+          # Override .cargo/config.toml `target-cpu=native` with a
+          # portable baseline that still keeps AVX2/FMA in the hot path.
+          rustflags: "-C target-cpu=x86-64-v3"
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.target }}
+          path: surface_priors_rs/dist/*.whl
+          if-no-files-found: error
+
+  sdist:
+    name: Build sdist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          working-directory: surface_priors_rs
+          command: sdist
+          args: --out dist
+      - name: Upload sdist artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: surface_priors_rs/dist/*.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: Attach wheels to GitHub Release
+    needs: [build, sdist]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Collect all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Show artifacts
+        run: ls -la dist
+      - name: Create / update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          name: ${{ github.event.inputs.tag || github.ref_name }}
+          generate_release_notes: true
+          files: dist/*

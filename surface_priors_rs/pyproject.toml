@@ -1,0 +1,29 @@
+[build-system]
+requires = ["maturin>=1.4,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "surface-priors-rs"
+version = "0.1.0"
+description = "Rust-backed Sentinel-2 L2A monthly composite builder; returns numpy arrays."
+requires-python = ">=3.9"
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: Implementation :: CPython",
+]
+
+[tool.maturin]
+# Build the cdylib feature-gated under "python"; this leaves the
+# release binary build unaffected and avoids pulling pyo3 into the
+# spx-build artefact.
+features = ["python"]
+bindings = "pyo3"
+# We don't want the spx-build binary inside the wheel; it ships as
+# a separate native binary.
+exclude = [
+    "src/bin/**",
+    "target/**",
+    "tests/**",
+    ".cargo/**",
+]
