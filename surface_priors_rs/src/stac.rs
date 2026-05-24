@@ -21,6 +21,9 @@ pub struct StacItem {
     pub geometry: serde_json::Value,
     pub assets: HashMap<String, String>,
     pub properties: serde_json::Value,
+    /// STAC collection this item came from. Needed for per-collection
+    /// asset routing (HLS L30 vs S30 have different band → asset maps).
+    pub collection: String,
 }
 
 #[derive(Deserialize)]
@@ -42,7 +45,7 @@ struct SearchResponse {
 
 pub struct StacClient {
     pub base_url: String,
-    pub collection: String,
+    pub collections: Vec<String>,
     pub bbox: [f64; 4],
     pub datetime: String,
     pub max_cloud_cover: Option<f64>,
@@ -52,7 +55,7 @@ pub struct StacClient {
 impl StacClient {
     pub fn new(
         base_url: impl Into<String>,
-        collection: impl Into<String>,
+        collections: Vec<String>,
         bbox: [f64; 4],
         datetime: impl Into<String>,
         max_cloud_cover: Option<f64>,
@@ -66,7 +69,7 @@ impl StacClient {
             .context("build reqwest client")?;
         Ok(Self {
             base_url: base_url.into(),
-            collection: collection.into(),
+            collections,
             bbox,
             datetime: datetime.into(),
             max_cloud_cover,
@@ -81,7 +84,7 @@ impl StacClient {
         let mut url = format!("{}/search", self.base_url.trim_end_matches('/'));
         let datetime = normalise_datetime(&self.datetime);
         let mut body = json!({
-            "collections": [self.collection],
+            "collections": self.collections,
             "bbox": self.bbox,
             "datetime": datetime,
             "limit": 100,
@@ -123,6 +126,11 @@ impl StacClient {
         let mut out: Vec<StacItem> = Vec::with_capacity(features.len());
         for feat in features {
             let id = feat.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let collection = feat
+                .get("collection")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             let geometry = feat.get("geometry").cloned().unwrap_or(serde_json::Value::Null);
             let props = feat.get("properties").cloned().unwrap_or(serde_json::Value::Null);
             let datetime = props.get("datetime").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -142,6 +150,7 @@ impl StacClient {
                 geometry,
                 assets,
                 properties: props,
+                collection,
             });
         }
         out.sort_by(|a, b| a.datetime.cmp(&b.datetime).then(a.id.cmp(&b.id)));
@@ -153,7 +162,7 @@ impl StacClient {
         let mut url = format!("{}/search", self.base_url.trim_end_matches('/'));
         let datetime = normalise_datetime(&self.datetime);
         let mut body = json!({
-            "collections": [self.collection],
+            "collections": self.collections,
             "bbox": self.bbox,
             "datetime": datetime,
             "limit": 100,
@@ -191,47 +200,7 @@ impl StacClient {
             request_body = next.body.clone();
         }
 
-        let mut out = Vec::with_capacity(all_features.len());
-        for feat in all_features {
-            let id = feat
-                .get("id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let geometry = feat
-                .get("geometry")
-                .cloned()
-                .unwrap_or(serde_json::Value::Null);
-            let props = feat
-                .get("properties")
-                .cloned()
-                .unwrap_or(serde_json::Value::Null);
-            let datetime = props
-                .get("datetime")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let mgrs_tile = mgrs_from_props_or_id(&props, &id);
-            let mut assets: HashMap<String, String> = HashMap::new();
-            if let Some(map) = feat.get("assets").and_then(|v| v.as_object()) {
-                for (key, val) in map {
-                    if let Some(href) = val.get("href").and_then(|v| v.as_str()) {
-                        assets.insert(key.clone(), href.to_string());
-                    }
-                }
-            }
-            out.push(StacItem {
-                id,
-                datetime,
-                mgrs_tile,
-                geometry,
-                assets,
-                properties: props,
-            });
-        }
-        // Stable ordering matches the Python implementation.
-        out.sort_by(|a, b| a.datetime.cmp(&b.datetime).then(a.id.cmp(&b.id)));
-        Ok(out)
+        Ok(Self::items_from_raw(all_features))
     }
 }
 
@@ -246,6 +215,13 @@ fn mgrs_from_props_or_id(props: &serde_json::Value, id: &str) -> String {
             return grid[5..].to_string();
         }
     }
+    // HLS exposes MGRS in three separate properties.
+    let utm = props.get("mgrs:utm_zone").and_then(|v| v.as_i64());
+    let band = props.get("mgrs:latitude_band").and_then(|v| v.as_str());
+    let sq = props.get("mgrs:grid_square").and_then(|v| v.as_str());
+    if let (Some(z), Some(b), Some(s)) = (utm, band, sq) {
+        return format!("{z:02}{b}{s}");
+    }
     // Parse from item id like "S2B_36RTU_20240705_0_L2A".
     let parts: Vec<&str> = id.split('_').collect();
     if parts.len() >= 2 && parts[0].starts_with("S2") {
@@ -255,6 +231,22 @@ fn mgrs_from_props_or_id(props: &serde_json::Value, id: &str) -> String {
             && tile[2..5].chars().all(|c| c.is_ascii_uppercase())
         {
             return tile.to_string();
+        }
+    }
+    // HLS id format: "HLS.L30.T36RUV.2024196T083601.v2.0".
+    if id.starts_with("HLS.") {
+        let parts: Vec<&str> = id.split('.').collect();
+        if parts.len() >= 3 {
+            let tile_part = parts[2];
+            if tile_part.starts_with('T') && tile_part.len() == 6 {
+                let tile = &tile_part[1..];
+                if tile.len() == 5
+                    && tile[0..2].chars().all(|c| c.is_ascii_digit())
+                    && tile[2..5].chars().all(|c| c.is_ascii_uppercase())
+                {
+                    return tile.to_string();
+                }
+            }
         }
     }
     String::new()

@@ -62,10 +62,13 @@ Planned extension point:
 ## Sentinel-2 L2A composites (Rust)
 
 The `surface_priors_rs/` directory in this repo contains a separately
-distributed Rust crate, **`surface-priors-rs`**, that builds Sentinel-2
-L2A best-pixel monthly composites end-to-end (STAC search → MGRS
-tile-aware selection → COG fetch → resample → compose) and exposes them
-to Python as numpy arrays — no GeoTIFF writes required.
+distributed Rust crate, **`surface-priors-rs`**, that builds best-pixel
+monthly composites end-to-end (STAC search → MGRS tile-aware selection
+→ COG fetch → resample → compose) and exposes them to Python as numpy
+arrays — no GeoTIFF writes required. Three sources are supported:
+Sentinel-2 L2A via Planetary Computer (default) or Element84, and
+Harmonized Landsat-Sentinel-2 (HLS v2.0) L30 + S30 via PC, combined
+into one harmonized 7-band pool.
 
 On a 16-core node from JASMIN it produces 5 years × 1 month over a
 100 × 100 km AOI at 60 m in about **6 seconds** parallel or **11
@@ -74,13 +77,21 @@ seconds** sequential, network-bound against Planetary Computer.
 ```python
 import surface_priors_rs as spx
 
+# Sentinel-2 L2A (12 bands)
 out = spx.build_composite(
     bbox=(30.5, 30.5, 31.6, 31.5),
     datetime="2024-07-01/2024-07-31",
     resolution=60.0,
     top_k=3,
     endpoint="pc",
-    bands=["coastal", "blue", "green", "red", "nir", "swir16", "swir22"],
+)
+
+# Harmonized Landsat-Sentinel-2 (7 common bands, Roy et al. NBAR)
+out = spx.build_composite(
+    bbox=(30.5, 30.5, 31.6, 31.5),
+    datetime="2024-07-01/2024-07-31",
+    resolution=60.0,
+    endpoint="hls",
 )
 
 red = out["bands"]["red"]      # uint16 ndarray (H, W)

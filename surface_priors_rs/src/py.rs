@@ -22,7 +22,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
 use crate::disk_cache::{grid_signature, DiskCache};
-use crate::endpoint::{auto_pick, EndpointConfig, EndpointKind, BAND_NAMES};
+use crate::endpoint::{auto_pick, EndpointConfig, EndpointKind};
 use crate::grid::GridSpec;
 use crate::pipeline::{
     compose_best_pixel, fetch_band, fetch_quality, scout_scene, select_chunk_tile_aware,
@@ -146,9 +146,10 @@ fn run_build(
 
         // 1. list_scenes
         let t = Instant::now();
+        let collections_key = endpoint.collections_key();
         let stac = StacClient::new(
             &endpoint.stac_url,
-            &endpoint.collection,
+            endpoint.collections.clone(),
             bbox,
             datetime.clone(),
             Some(max_cloud_cover),
@@ -156,7 +157,7 @@ fn run_build(
         let raw_items = if let Some(c) = &cache {
             let key = c.search_key(
                 &endpoint.stac_url,
-                &endpoint.collection,
+                &collections_key,
                 bbox,
                 &datetime,
                 Some(max_cloud_cover),
@@ -172,15 +173,14 @@ fn run_build(
         } else {
             stac.search_raw().await.context("STAC search")?
         };
-        // Sign for PC if needed.
-        let signed_items: Vec<serde_json::Value> = if matches!(endpoint.kind, EndpointKind::PlanetaryComputer) {
+        // Sign for PC / HLS if needed (anonymous endpoints pass through
+        // sign_item unchanged).
+        let signed_items: Vec<serde_json::Value> = {
             let mut signed = Vec::with_capacity(raw_items.len());
             for raw in raw_items {
                 signed.push(endpoint.sign_item(&http, raw).await?);
             }
             signed
-        } else {
-            raw_items
         };
         let items = StacClient::items_from_raw(signed_items);
         timings.insert("list_scenes".to_string(), t.elapsed().as_secs_f64());
@@ -196,7 +196,7 @@ fn run_build(
             for item in &items {
                 let key = c.scout_key(
                     &endpoint.stac_url,
-                    &endpoint.collection,
+                    &collections_key,
                     &item.id,
                     &gsig,
                     512,
@@ -228,13 +228,35 @@ fn run_build(
             to_scout.extend(items.iter().cloned());
         }
         let mut tasks = FuturesUnordered::new();
+        let quality_kind = endpoint.quality_kind;
         for item in to_scout {
             let http = http.clone();
             let grid = grid;
             let sem = request_semaphore.clone();
-            let scl_asset = endpoint.scl_asset.clone();
+            // Each scene resolves to its own per-collection quality asset
+            // (SCL for S2 L2A scenes, Fmask for HLS L30/S30 scenes).
+            let quality_asset = match endpoint.quality_asset_for(&item.collection) {
+                Some(a) => a.to_string(),
+                None => {
+                    tracing::warn!(
+                        scene = %item.id,
+                        collection = %item.collection,
+                        "no quality asset for this collection; skipping scout"
+                    );
+                    continue;
+                }
+            };
             tasks.push(tokio::spawn(async move {
-                scout_scene(http, &item, &grid, coarse_resolution, sem, &scl_asset).await
+                scout_scene(
+                    http,
+                    &item,
+                    &grid,
+                    coarse_resolution,
+                    sem,
+                    &quality_asset,
+                    quality_kind,
+                )
+                .await
             }));
         }
         let scout_cache = cache.clone();
@@ -244,7 +266,7 @@ fn run_build(
                     if let Some(c) = &scout_cache {
                         let key = c.scout_key(
                             &endpoint.stac_url,
-                            &endpoint.collection,
+                            &collections_key,
                             &s.item_id,
                             &gsig,
                             512,
@@ -289,74 +311,92 @@ fn run_build(
 
         // 4. fetch
         let t = Instant::now();
-        // Resolve the band subset (if any) into (stable_name, asset_key) pairs,
-        // preserving the caller-requested order. If no subset is given we
-        // fetch all 12 bands in the canonical BAND_NAMES order.
-        let (band_names_out, band_assets): (Vec<String>, Vec<String>) =
-            if let Some(subset) = bands_subset.as_ref() {
-                let asset_lookup: HashMap<&str, &str> = BAND_NAMES
-                    .iter()
-                    .copied()
-                    .zip(endpoint.band_assets.iter().map(|s| s.as_str()))
-                    .collect();
-                let mut names = Vec::with_capacity(subset.len());
-                let mut assets = Vec::with_capacity(subset.len());
-                for n in subset {
-                    let a = asset_lookup.get(n.as_str()).copied().ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "unknown band {n:?}; valid: {:?}",
-                            BAND_NAMES
-                        )
-                    })?;
-                    names.push(n.clone());
-                    assets.push(a.to_string());
+        // Resolve the band subset (if any) against the endpoint's
+        // supported band set, preserving caller-requested order. If no
+        // subset is given we default to whatever the endpoint exposes
+        // (12 bands for S2 L2A, 7 harmonized bands for HLS).
+        let band_names_out: Vec<String> = if let Some(subset) = bands_subset.as_ref() {
+            let supported: HashMap<&str, ()> = endpoint
+                .band_names_supported
+                .iter()
+                .copied()
+                .map(|n| (n, ()))
+                .collect();
+            for n in subset {
+                if !supported.contains_key(n.as_str()) {
+                    anyhow::bail!(
+                        "band {n:?} not supported by endpoint {:?}; valid: {:?}",
+                        endpoint.kind,
+                        endpoint.band_names_supported
+                    );
                 }
-                (names, assets)
-            } else {
-                (
-                    BAND_NAMES.iter().map(|s| (*s).to_string()).collect(),
-                    endpoint.band_assets.clone(),
-                )
-            };
+            }
+            subset.clone()
+        } else {
+            endpoint
+                .band_names_supported
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect()
+        };
         let scenes_for_fetch: Vec<crate::stac::StacItem> =
             picks.iter().map(|p| p.scene.clone()).collect();
         let mut band_tasks = FuturesUnordered::new();
         for (scene_idx, scene) in scenes_for_fetch.iter().enumerate() {
-            for (band_idx, band) in band_assets.iter().enumerate() {
+            for (band_idx, band_name) in band_names_out.iter().enumerate() {
+                // Per-scene asset resolution: HLS L30 and S30 use the
+                // same stable band name but different asset keys.
+                let Some(asset) = endpoint.asset_for(&scene.collection, band_name) else {
+                    tracing::warn!(
+                        scene = %scene.id,
+                        collection = %scene.collection,
+                        band = %band_name,
+                        "endpoint doesn't expose this band on this collection; skipping"
+                    );
+                    continue;
+                };
+                let asset = asset.to_string();
                 let scene = scene.clone();
-                let band = band.clone();
                 let http = http.clone();
                 let grid = grid;
                 let sem = request_semaphore.clone();
                 band_tasks.push(tokio::spawn(async move {
-                    let res = fetch_band(http, &scene, &band, &grid, sem).await?;
+                    let res = fetch_band(http, &scene, &asset, &grid, sem).await?;
                     Ok::<(usize, usize, Option<Vec<u16>>), anyhow::Error>((
                         scene_idx, band_idx, res,
                     ))
                 }));
             }
+            let Some(quality_asset) = endpoint.quality_asset_for(&scene.collection) else {
+                tracing::warn!(
+                    scene = %scene.id,
+                    collection = %scene.collection,
+                    "no quality asset for this collection; scene cannot contribute"
+                );
+                continue;
+            };
+            let quality_asset = quality_asset.to_string();
             let scene = scene.clone();
             let http = http.clone();
             let grid = grid;
             let sem = request_semaphore.clone();
-            let scl_asset = endpoint.scl_asset.clone();
             band_tasks.push(tokio::spawn(async move {
-                let res = fetch_quality(http, &scene, &grid, sem, &scl_asset).await?;
+                let res = fetch_quality(http, &scene, &grid, sem, &quality_asset).await?;
                 Ok::<(usize, usize, Option<Vec<u16>>), anyhow::Error>((
                     scene_idx,
                     usize::MAX,
-                    res.map(|scl| scl.iter().map(|&b| b as u16).collect()),
+                    res.map(|q| q.iter().map(|&b| b as u16).collect()),
                 ))
             }));
         }
         let mut bands_by_scene: Vec<Vec<Option<Vec<u16>>>> =
-            vec![vec![None; band_assets.len()]; scenes_for_fetch.len()];
-        let mut scl_by_scene: Vec<Option<Vec<u8>>> = vec![None; scenes_for_fetch.len()];
+            vec![vec![None; band_names_out.len()]; scenes_for_fetch.len()];
+        let mut quality_by_scene: Vec<Option<Vec<u8>>> = vec![None; scenes_for_fetch.len()];
         while let Some(res) = band_tasks.next().await {
             match res {
                 Ok(Ok((scene_idx, band_idx, data))) => {
                     if band_idx == usize::MAX {
-                        scl_by_scene[scene_idx] =
+                        quality_by_scene[scene_idx] =
                             data.map(|v| v.iter().map(|&x| x as u8).collect());
                     } else {
                         bands_by_scene[scene_idx][band_idx] = data;
@@ -368,13 +408,13 @@ fn run_build(
         }
         let mut observations: Vec<(String, Vec<Vec<u16>>, Vec<u8>)> = Vec::new();
         for (idx, scene) in scenes_for_fetch.iter().enumerate() {
-            let scl = match scl_by_scene[idx].take() {
+            let quality = match quality_by_scene[idx].take() {
                 Some(v) => v,
                 None => continue,
             };
-            let mut bands_data = Vec::with_capacity(band_assets.len());
+            let mut bands_data = Vec::with_capacity(band_names_out.len());
             let mut ok = true;
-            for b in 0..band_assets.len() {
+            for b in 0..band_names_out.len() {
                 match bands_by_scene[idx][b].take() {
                     Some(d) => bands_data.push(d),
                     None => {
@@ -386,13 +426,14 @@ fn run_build(
             if !ok {
                 continue;
             }
-            observations.push((scene.id.clone(), bands_data, scl));
+            observations.push((scene.id.clone(), bands_data, quality));
         }
         timings.insert("fetch".to_string(), t.elapsed().as_secs_f64());
 
         // 5. compose
         let t = Instant::now();
-        let composite = compose_best_pixel(grid, band_assets.len(), observations);
+        let composite =
+            compose_best_pixel(grid, band_names_out.len(), observations, quality_kind);
         timings.insert("compose".to_string(), t.elapsed().as_secs_f64());
         timings.insert("total".to_string(), t_total.elapsed().as_secs_f64());
 
@@ -420,7 +461,7 @@ fn run_build(
             source_ids: composite.source_ids,
             timings,
             endpoint_url: endpoint.stac_url.clone(),
-            collection: endpoint.collection.clone(),
+            collection: endpoint.collections_key(),
             partition_tiles,
             multi_tile_chunks,
         })

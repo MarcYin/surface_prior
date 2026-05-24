@@ -1,20 +1,27 @@
 # surface-priors-rs
 
-Production Rust port of the surface-priors Sentinel-2 L2A monthly
-composite pipeline, with optional Python bindings that return numpy
-arrays directly (no GeoTIFF writes).
+Production Rust port of the surface-priors monthly composite pipeline,
+with optional Python bindings that return numpy arrays directly (no
+GeoTIFF writes). Supports three STAC sources out of the box:
+
+| Endpoint | Collection(s) | Bands | Quality mask |
+|---|---|---|---|
+| `pc` (default) | Sentinel-2 L2A | 12 (full S2 set) | SCL |
+| `earth-search` | Sentinel-2 L2A | 12 (full S2 set) | SCL |
+| `hls` | HLS L30 + S30 (combined harmonized pool) | 7 common bands | Fmask |
 
 ## What it does
 
-- Asynchronously fetches Sentinel-2 L2A scenes from Planetary Computer
-  (default) or Element84 earth-search via STAC search + range-request
-  COG reads.
+- Asynchronously fetches scenes from Planetary Computer (default), the
+  Element84 earth-search S2 L2A mirror, or PC's Harmonized Landsat-
+  Sentinel-2 (HLS v2.0) via STAC search + range-request COG reads.
 - Selects the top-k clearest observations per MGRS-tile-aware chunk
-  using a coarse SCL-based scout pass.
+  using a coarse quality scout pass (SCL classes for S2 L2A; Fmask
+  bit-flags for HLS).
 - Decodes DEFLATE-compressed COG tiles via libdeflate, undoes
   TIFF predictor=2, and reprojects to a user-specified UTM grid with
   an AVX2/FMA bilinear resampler.
-- Composes a best-pixel monthly composite ranked by SCL quality.
+- Composes a best-pixel monthly composite ranked by per-pixel quality.
 
 For a 100 × 100 km AOI at 60 m resolution, top-k=3 from Planetary
 Computer, on a single 16-core Zen 4 node:
@@ -70,11 +77,41 @@ print(out["grid"])                          # bounds, epsg, transform — for ge
 
 Available band names (stable across endpoints):
 `coastal, blue, green, red, rededge1, rededge2, rededge3, nir, nir08,
-nir09, swir16, swir22`. SCL is consumed internally to derive the
-`quality` raster — kept as a discrete class label (nearest resampling)
-all the way through, so quality buckets stay categorical.
+nir09, swir16, swir22`. SCL / Fmask is consumed internally to derive
+the `quality` raster — kept as a discrete class label (nearest
+resampling) all the way through, so quality buckets stay categorical.
 
-Pass `bands=None` (or omit) to fetch all 12.
+Pass `bands=None` (or omit) to fetch all bands the endpoint supports
+(12 for S2 L2A, 7 for HLS).
+
+### Harmonized Landsat-Sentinel-2 (HLS)
+
+`endpoint="hls"` pulls from PC's `hls2-l30` + `hls2-s30` collections
+in a single combined pool and composites them together. HLS already
+applies the Roy et al. c-factor NBAR-style normalisation, so Landsat-8/9
+OLI and Sentinel-2 MSI observations are bit-comparable.
+
+Only the 7 harmonized common bands are exposed: `coastal, blue, green,
+red, nir, swir16, swir22`. The "nir" band uses Landsat's B05 / Sentinel-2's
+B8A (narrow NIR — the harmonized choice from Roy 2021), not S2's B08
+broad NIR.
+
+```python
+out = spx.build_composite(
+    bbox=(30.5, 30.5, 31.6, 31.5),
+    datetime="2024-07-01/2024-07-31",
+    resolution=60.0,
+    endpoint="hls",
+)
+# 5-year × 1-month over a 100 km AOI, parallel-5: ~7 s
+```
+
+Internally HLS scenes resolve their per-collection asset names
+on-the-fly: for the same band slot ("red"), L30 reads `B04` and S30
+reads `B04` (they happen to align), while "nir" reads `B05` on L30 and
+`B8A` on S30. Quality scoring uses the bit-packed Fmask: cloud,
+cirrus, cloud shadow, snow, and high aerosol bits each weight into a
+lower-is-better score that drives best-pixel selection.
 
 ## Use from the command line
 

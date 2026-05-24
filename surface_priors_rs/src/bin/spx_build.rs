@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use surface_priors_rs::disk_cache::{grid_signature, DiskCache};
-use surface_priors_rs::endpoint::{auto_pick, EndpointConfig, EndpointKind, BAND_NAMES};
+use surface_priors_rs::endpoint::{auto_pick, EndpointConfig, EndpointKind};
 use surface_priors_rs::grid::GridSpec;
 use surface_priors_rs::pipeline::{
     compose_best_pixel, fetch_band, fetch_quality, scout_scene, select_chunk_tile_aware,
@@ -145,9 +145,10 @@ async fn async_main() -> Result<()> {
         EndpointKind::parse(&cli.endpoint)?
     };
     let endpoint = Arc::new(EndpointConfig::build(endpoint_kind));
+    let collections_key = endpoint.collections_key();
     eprintln!(
-        "endpoint: {:?} ({})  collection: {}",
-        endpoint.kind, endpoint.stac_url, endpoint.collection
+        "endpoint: {:?} ({})  collections: {}",
+        endpoint.kind, endpoint.stac_url, collections_key
     );
 
     let mut timing = Timing::default();
@@ -168,7 +169,7 @@ async fn async_main() -> Result<()> {
     let t = Instant::now();
     let stac = StacClient::new(
         &endpoint.stac_url,
-        &endpoint.collection,
+        endpoint.collections.clone(),
         bbox,
         cli.datetime.clone(),
         Some(cli.max_cloud_cover),
@@ -176,7 +177,7 @@ async fn async_main() -> Result<()> {
     let raw_items = if let Some(c) = &cache {
         let key = c.search_key(
             &endpoint.stac_url,
-            &endpoint.collection,
+            &collections_key,
             bbox,
             &cli.datetime,
             Some(cli.max_cloud_cover),
@@ -199,14 +200,13 @@ async fn async_main() -> Result<()> {
     // *before* converting to StacItem (so all downstream HTTP reads
     // include the SAS query string). Cache stores the raw unsigned
     // items so subsequent runs re-sign with a fresh token.
-    let signed_items: Vec<serde_json::Value> = if matches!(endpoint.kind, EndpointKind::PlanetaryComputer) {
+    // sign_item is a no-op for anonymous endpoints.
+    let signed_items: Vec<serde_json::Value> = {
         let mut signed = Vec::with_capacity(raw_items.len());
         for raw in raw_items {
             signed.push(endpoint.sign_item(&http, raw).await?);
         }
         signed
-    } else {
-        raw_items
     };
     let items = StacClient::items_from_raw(signed_items);
     timing.list_scenes = t.elapsed().as_secs_f64();
@@ -224,7 +224,7 @@ async fn async_main() -> Result<()> {
         for item in &items {
             let key = c.scout_key(
                 &endpoint.stac_url,
-                &endpoint.collection,
+                &collections_key,
                 &item.id,
                 &gsig,
                 512, // chunk_size for stable key alignment with partition
@@ -260,13 +260,33 @@ async fn async_main() -> Result<()> {
     }
 
     let mut tasks = FuturesUnordered::new();
+    let quality_kind = endpoint.quality_kind;
     for item in to_scout {
         let http = http.clone();
         let grid = grid;
         let sem = request_semaphore.clone();
-        let scl_asset = endpoint.scl_asset.clone();
+        let quality_asset = match endpoint.quality_asset_for(&item.collection) {
+            Some(a) => a.to_string(),
+            None => {
+                tracing::warn!(
+                    scene = %item.id,
+                    collection = %item.collection,
+                    "no quality asset for this collection; skipping scout"
+                );
+                continue;
+            }
+        };
         tasks.push(tokio::spawn(async move {
-            scout_scene(http, &item, &grid, coarse_resolution, sem, &scl_asset).await
+            scout_scene(
+                http,
+                &item,
+                &grid,
+                coarse_resolution,
+                sem,
+                &quality_asset,
+                quality_kind,
+            )
+            .await
         }));
     }
     let scout_cache = cache.clone();
@@ -277,7 +297,7 @@ async fn async_main() -> Result<()> {
                 if let Some(c) = &scout_cache {
                     let key = c.scout_key(
                         &endpoint.stac_url,
-                        &endpoint.collection,
+                        &collections_key,
                         &s.item_id,
                         &gsig_for_store,
                         512,
@@ -374,48 +394,56 @@ async fn async_main() -> Result<()> {
         anyhow::bail!("no usable scenes after scout — aborting");
     }
 
-    // --- Fetch picked scenes (bands + SCL), one task per (scene, band) ----
+    // --- Fetch picked scenes (bands + quality), one task per (scene, band)
     let t = Instant::now();
-    // band_assets is the per-endpoint asset key list, in stable
-    // BAND_NAMES order. fetch_band looks up `scene.assets[asset_key]`.
-    let band_assets: Vec<String> = endpoint.band_assets.clone();
+    // Iterate stable band names; resolve asset key per-scene because
+    // HLS L30 and S30 use different asset keys for the same band.
+    let band_names_out: Vec<&'static str> =
+        endpoint.band_names_supported.iter().copied().collect();
     let scenes_for_fetch: Vec<surface_priors_rs::stac::StacItem> = picks.iter().map(|p| p.scene.clone()).collect();
     let mut band_tasks = FuturesUnordered::new();
     for (scene_idx, scene) in scenes_for_fetch.iter().enumerate() {
-        for (band_idx, band) in band_assets.iter().enumerate() {
+        for (band_idx, band_name) in band_names_out.iter().enumerate() {
+            let Some(asset) = endpoint.asset_for(&scene.collection, band_name) else {
+                continue;
+            };
+            let asset = asset.to_string();
             let scene = scene.clone();
-            let band = band.clone();
             let http = http.clone();
             let grid = grid;
             let sem = request_semaphore.clone();
             band_tasks.push(tokio::spawn(async move {
-                let res = fetch_band(http, &scene, &band, &grid, sem).await?;
+                let res = fetch_band(http, &scene, &asset, &grid, sem).await?;
                 Ok::<(usize, usize, Option<Vec<u16>>), anyhow::Error>((scene_idx, band_idx, res))
             }));
         }
-        // SCL too.
+        // Quality (SCL or Fmask) too.
+        let Some(quality_asset) = endpoint.quality_asset_for(&scene.collection) else {
+            continue;
+        };
+        let quality_asset = quality_asset.to_string();
         let scene = scene.clone();
         let http = http.clone();
         let grid = grid;
         let sem = request_semaphore.clone();
-        let scl_asset = endpoint.scl_asset.clone();
         band_tasks.push(tokio::spawn(async move {
-            let res = fetch_quality(http, &scene, &grid, sem, &scl_asset).await?;
+            let res = fetch_quality(http, &scene, &grid, sem, &quality_asset).await?;
             Ok::<(usize, usize, Option<Vec<u16>>), anyhow::Error>((
                 scene_idx,
                 usize::MAX,
-                res.map(|scl| scl.iter().map(|&b| b as u16).collect()),
+                res.map(|q| q.iter().map(|&b| b as u16).collect()),
             ))
         }));
     }
     let mut bands_by_scene: Vec<Vec<Option<Vec<u16>>>> =
-        vec![vec![None; band_assets.len()]; scenes_for_fetch.len()];
-    let mut scl_by_scene: Vec<Option<Vec<u8>>> = vec![None; scenes_for_fetch.len()];
+        vec![vec![None; band_names_out.len()]; scenes_for_fetch.len()];
+    let mut quality_by_scene: Vec<Option<Vec<u8>>> = vec![None; scenes_for_fetch.len()];
     while let Some(res) = band_tasks.next().await {
         match res {
             Ok(Ok((scene_idx, band_idx, data))) => {
                 if band_idx == usize::MAX {
-                    scl_by_scene[scene_idx] = data.map(|v| v.iter().map(|&x| x as u8).collect());
+                    quality_by_scene[scene_idx] =
+                        data.map(|v| v.iter().map(|&x| x as u8).collect());
                 } else {
                     bands_by_scene[scene_idx][band_idx] = data;
                 }
@@ -426,13 +454,13 @@ async fn async_main() -> Result<()> {
     }
     let mut observations: Vec<(String, Vec<Vec<u16>>, Vec<u8>)> = Vec::new();
     for (idx, scene) in scenes_for_fetch.iter().enumerate() {
-        let scl = match scl_by_scene[idx].take() {
+        let quality = match quality_by_scene[idx].take() {
             Some(v) => v,
             None => continue,
         };
-        let mut bands_data = Vec::with_capacity(band_assets.len());
+        let mut bands_data = Vec::with_capacity(band_names_out.len());
         let mut ok = true;
-        for b in 0..band_assets.len() {
+        for b in 0..band_names_out.len() {
             match bands_by_scene[idx][b].take() {
                 Some(d) => bands_data.push(d),
                 None => { ok = false; break; }
@@ -441,7 +469,7 @@ async fn async_main() -> Result<()> {
         if !ok {
             continue;
         }
-        observations.push((scene.id.clone(), bands_data, scl));
+        observations.push((scene.id.clone(), bands_data, quality));
     }
     timing.fetch = t.elapsed().as_secs_f64();
     eprintln!(
@@ -452,7 +480,8 @@ async fn async_main() -> Result<()> {
 
     // --- Compose best-pixel ------------------------------------------------
     let t = Instant::now();
-    let composite = compose_best_pixel(grid, band_assets.len(), observations);
+    let composite =
+        compose_best_pixel(grid, band_names_out.len(), observations, quality_kind);
     timing.compose = t.elapsed().as_secs_f64();
     eprintln!("compose:        {:6.2}s", timing.compose);
 
@@ -474,10 +503,12 @@ async fn async_main() -> Result<()> {
         // compression is CPU-heavy (~150 ms per band on this AOI); with
         // 24 cores rayon collapses ~2.3 s sequential wall to ~0.3 s.
         use rayon::prelude::*;
-        // Output filenames are stable BAND_NAMES regardless of which
+        // Output filenames are stable band names regardless of which
         // STAC endpoint we read from — so a "red.tif" produced via PC
-        // is interchangeable with a "red.tif" produced via Element84.
-        let band_paths: Vec<(std::path::PathBuf, usize)> = BAND_NAMES
+        // is interchangeable with a "red.tif" produced via Element84
+        // (and HLS, where the asset names differ but the harmonized
+        // common-band names match).
+        let band_paths: Vec<(std::path::PathBuf, usize)> = band_names_out
             .iter()
             .enumerate()
             .map(|(i, name)| (cli.out_dir.join(format!("{name}.tif")), i))
@@ -517,7 +548,7 @@ async fn async_main() -> Result<()> {
         });
         // STAC item JSON.
         let mut assets = serde_json::Map::new();
-        for name in BAND_NAMES.iter() {
+        for name in band_names_out.iter() {
             assets.insert(
                 name.to_string(),
                 serde_json::json!({
@@ -563,9 +594,9 @@ async fn async_main() -> Result<()> {
                 "proj:shape": [grid.height, grid.width],
                 "proj:transform": grid.affine_transform(),
                 "surface:compositor": "rust_best_pixel_v1",
-                "surface:band_names": BAND_NAMES.to_vec(),
+                "surface:band_names": band_names_out.clone(),
                 "surface:stac_url": &endpoint.stac_url,
-                "surface:collection": &endpoint.collection,
+                "surface:collection": &collections_key,
                 "surface:source_count": composite.source_ids.len(),
                 "surface:source_items": source_items,
                 "surface:partition": partition_summary,

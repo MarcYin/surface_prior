@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::cog::{open_cog, read_tiles, stitch_tiles, CogProfile, PixelWindow, SampleFormat};
+use crate::endpoint::QualityKind;
 use crate::grid::{cog_window_for_utm, resample_u16_to_u16, resample_u8_to_u8, GridSpec};
 use crate::stac::StacItem;
 
@@ -48,36 +49,36 @@ pub struct SceneStats {
     pub mean_clear: f32,
 }
 
-/// SCL classes considered "clear sky over land/water" (matches Python).
-const SCL_CLEAR: [u8; 4] = [4, 5, 6, 11];
-const SCL_NODATA: u8 = 0;
-
-/// Scout a single scene: open its SCL COG, read at coarse resolution,
-/// compute per-AOI usable_fraction + mean_clear.
+/// Scout a single scene: open its quality COG, read at coarse
+/// resolution, compute per-AOI usable_fraction + mean_clear. The
+/// `quality_kind` selects how each pixel is interpreted (SCL classes
+/// for S2 L2A, Fmask bit-flags for HLS).
 pub async fn scout_scene(
     http: Arc<reqwest::Client>,
     scene: &StacItem,
     grid: &GridSpec,
     coarse_resolution: f64,
     semaphore: Arc<tokio::sync::Semaphore>,
-    scl_asset: &str,
+    quality_asset: &str,
+    quality_kind: QualityKind,
 ) -> Result<SceneStats> {
     let url = scene
         .assets
-        .get(scl_asset)
-        .ok_or_else(|| anyhow::anyhow!("scene {} missing {} asset", scene.id, scl_asset))?
+        .get(quality_asset)
+        .ok_or_else(|| anyhow::anyhow!("scene {} missing {} asset", scene.id, quality_asset))?
         .clone();
     let cog = open_cog(&http, &url)
         .await
-        .with_context(|| format!("open SCL {url}"))?;
-    // SCL native is 20 m; we want coarse_resolution metres per pixel.
-    let scl_native_res = cog
+        .with_context(|| format!("open quality {url}"))?;
+    // Native quality pixel size: SCL is 20 m, Fmask is 30 m; pulled
+    // from the COG tags so the math is endpoint-agnostic.
+    let native_res = cog
         .pixel_scale
         .map(|s| s[0])
         .unwrap_or(20.0);
-    let decimation = (coarse_resolution / scl_native_res).max(1.0);
+    let decimation = (coarse_resolution / native_res).max(1.0);
     let level = cog.level_for_decimation(decimation);
-    let pixel_size = scl_native_res * (cog.width as f64 / level.width as f64);
+    let pixel_size = native_res * (cog.width as f64 / level.width as f64);
     let origin = cog
         .tie_point
         .map(|t| [t[3], t[4]])
@@ -122,7 +123,7 @@ pub async fn scout_scene(
         origin[1] - win.row_off as f64 * pixel_size,
     ];
     let dst_origin = [grid.bounds[0], grid.bounds[3]];
-    let scl = resample_u8_to_u8(
+    let quality_buf = resample_u8_to_u8(
         &buf,
         (win.width, win.height),
         level_origin,
@@ -131,7 +132,7 @@ pub async fn scout_scene(
         dst_origin,
         grid.resolution,
     )?;
-    let (usable, mean_clear) = scl_to_stats(&scl);
+    let (usable, mean_clear) = quality_to_stats(&quality_buf, quality_kind);
     Ok(SceneStats {
         item_id: scene.id.clone(),
         usable_fraction: usable,
@@ -139,19 +140,19 @@ pub async fn scout_scene(
     })
 }
 
-fn scl_to_stats(scl: &[u8]) -> (f32, f32) {
+fn quality_to_stats(buf: &[u8], kind: QualityKind) -> (f32, f32) {
     let mut valid = 0u32;
     let mut clear = 0u32;
-    for &v in scl {
-        if v == SCL_NODATA {
+    for &v in buf {
+        if kind.is_nodata(v) {
             continue;
         }
         valid += 1;
-        if SCL_CLEAR.contains(&v) {
+        if kind.is_clear(v) {
             clear += 1;
         }
     }
-    let total = scl.len() as f32;
+    let total = buf.len() as f32;
     let usable = if total > 0.0 { valid as f32 / total } else { 0.0 };
     let mean_clear = if valid > 0 {
         clear as f32 / valid as f32
@@ -376,15 +377,17 @@ pub async fn fetch_band(
     Ok(Some(out))
 }
 
-/// SCL quality at full resolution for fetch-time best-pixel scoring.
+/// Quality raster at full resolution for fetch-time best-pixel
+/// scoring. Returns the resampled u8 buffer; caller scores it via
+/// `quality_to_score` using the endpoint's QualityKind.
 pub async fn fetch_quality(
     http: Arc<reqwest::Client>,
     scene: &StacItem,
     grid: &GridSpec,
     semaphore: Arc<tokio::sync::Semaphore>,
-    scl_asset: &str,
+    quality_asset: &str,
 ) -> Result<Option<Vec<u8>>> {
-    let Some(url) = scene.assets.get(scl_asset).cloned() else {
+    let Some(url) = scene.assets.get(quality_asset).cloned() else {
         return Ok(None);
     };
     let cog = open_cog(&http, &url).await?;
@@ -441,20 +444,22 @@ pub async fn fetch_quality(
     Ok(Some(scl))
 }
 
-/// SCL → quality score: lower is better. Clear=0, marginal=1, dark=2,
-/// everything else is nodata (max u16).
-pub fn scl_to_quality(scl: &[u8]) -> Vec<u16> {
-    const NODATA: u16 = 65535;
-    let mut out = vec![NODATA; scl.len()];
-    for (i, &v) in scl.iter().enumerate() {
-        out[i] = match v {
-            4 | 5 | 6 | 11 => 0,
-            7 => 1,
-            2 | 3 => 2,
-            _ => NODATA,
-        };
+/// Quality raster → per-pixel score: lower is better. The mapping
+/// is selected by `QualityKind` so this works for both SCL (S2 L2A)
+/// and Fmask (HLS).
+pub fn quality_to_score(buf: &[u8], kind: QualityKind) -> Vec<u16> {
+    let mut out = vec![0u16; buf.len()];
+    for (i, &v) in buf.iter().enumerate() {
+        out[i] = kind.score(v);
     }
     out
+}
+
+/// Back-compat alias: existing callers that fetched SCL u8 still call
+/// `scl_to_quality` from outside the crate. Kept as a thin shim over
+/// `quality_to_score(SCL)`.
+pub fn scl_to_quality(scl: &[u8]) -> Vec<u16> {
+    quality_to_score(scl, QualityKind::Scl)
 }
 
 #[derive(Debug)]
@@ -472,14 +477,14 @@ pub struct Composite {
     pub source_ids: Vec<String>,
 }
 
-/// Best-pixel compose across all selected observations.
-/// The compose step is ~0.3 s on the verification AOI; keep it
-/// sequential for clarity. Quality mapping (the only branch-heavy
-/// part) is precomputed in parallel.
+/// Best-pixel compose across all selected observations. Quality
+/// mapping is precomputed in parallel using `kind` so the same
+/// composer handles both SCL and Fmask scenes.
 pub fn compose_best_pixel(
     grid: GridSpec,
     n_bands: usize,
     observations: Vec<(String, Vec<Vec<u16>>, Vec<u8>)>,
+    kind: QualityKind,
 ) -> Composite {
     let n_pixels = (grid.width * grid.height) as usize;
     const NODATA: u16 = 65535;
@@ -490,7 +495,7 @@ pub fn compose_best_pixel(
     let source_ids: Vec<String> = observations.iter().map(|(id, _, _)| id.clone()).collect();
     let qualities: Vec<Vec<u16>> = observations
         .par_iter()
-        .map(|(_, _, scl)| scl_to_quality(scl))
+        .map(|(_, _, q)| quality_to_score(q, kind))
         .collect();
 
     for (obs_idx, (_, bands_data, _)) in observations.iter().enumerate() {

@@ -47,10 +47,12 @@ Sources that can resolve their native grid, such as the `edown` Google Earth Eng
 ## Sentinel-2 L2A composites (Rust)
 
 The repository also ships a separate Rust crate, **`surface-priors-rs`**,
-that produces Sentinel-2 L2A best-pixel monthly composites and returns
-them to Python as numpy arrays. On a 16-core node it builds 5 years × 1
-month over a 100 × 100 km AOI at 60 m in roughly 6 seconds, network-bound
-against Planetary Computer.
+that produces best-pixel monthly composites and returns them to Python
+as numpy arrays. Supports Sentinel-2 L2A (Planetary Computer / Element84,
+12 bands) and HLS v2.0 L30 + S30 (Planetary Computer, combined harmonized
+7-band pool). On a 16-core node it builds 5 years × 1 month over a
+100 × 100 km AOI at 60 m in roughly 6-7 seconds, network-bound against
+Planetary Computer.
 
 ```python
 import surface_priors_rs as spx
@@ -60,7 +62,7 @@ out = spx.build_composite(
     datetime="2024-07-01/2024-07-31",
     resolution=60.0,
     top_k=3,
-    endpoint="pc",
+    endpoint="pc",   # or "hls" for Harmonized Landsat-Sentinel-2
 )
 red = out["bands"]["red"]   # uint16 ndarray (H, W)
 ```
