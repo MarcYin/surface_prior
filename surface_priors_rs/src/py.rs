@@ -138,6 +138,65 @@ fn build_composite(
     encode_result(py, result)
 }
 
+#[pyfunction]
+#[pyo3(signature = (
+    bbox,
+    years,
+    months,
+    resolution = 60.0,
+    top_k = 3,
+    max_cloud_cover = 90.0,
+    concurrency = 600,
+    endpoint = "auto".to_string(),
+    disk_cache = None,
+    scout_factor = 8,
+    bands = None,
+))]
+#[allow(clippy::too_many_arguments)]
+fn build_monthly_composites(
+    py: Python<'_>,
+    bbox: [f64; 4],
+    years: Vec<u32>,
+    months: Vec<u32>,
+    resolution: f64,
+    top_k: usize,
+    max_cloud_cover: f64,
+    concurrency: usize,
+    endpoint: String,
+    disk_cache: Option<String>,
+    scout_factor: u32,
+    bands: Option<Vec<String>>,
+) -> PyResult<Bound<'_, PyList>> {
+    if years.is_empty() {
+        return Err(PyRuntimeError::new_err("years must be non-empty"));
+    }
+    if months.is_empty() {
+        return Err(PyRuntimeError::new_err("months must be non-empty"));
+    }
+    for &m in &months {
+        if !(1..=12).contains(&m) {
+            return Err(PyRuntimeError::new_err(format!(
+                "month {m} out of range 1..=12"
+            )));
+        }
+    }
+    let results = py
+        .allow_threads(|| {
+            run_build_periods(
+                bbox, years, months, resolution, top_k, max_cloud_cover, concurrency,
+                endpoint, disk_cache, scout_factor, bands,
+            )
+        })
+        .map_err(|e| PyRuntimeError::new_err(format!("{e:#}")))?;
+    encode_period_results(py, results)
+}
+
+struct PeriodResult {
+    year: u32,
+    month: u32,
+    build: BuildResult,
+}
+
 struct BuildResult {
     grid: GridSpec,
     bands: Vec<Vec<u16>>,
@@ -541,6 +600,474 @@ fn run_build(
     })
 }
 
+/// Multi-period orchestrator: ONE STAC search + scout, then iterates
+/// (year, month) combinations re-using the shared scene list.
+///
+/// For "monthly composite of June/July/August across 2018-2020" this
+/// hits STAC + scout once across the full datetime range, then runs
+/// 9 separate fetch+compose phases sharing the same connection pool.
+#[allow(clippy::too_many_arguments)]
+fn run_build_periods(
+    bbox: [f64; 4],
+    years: Vec<u32>,
+    months: Vec<u32>,
+    resolution: f64,
+    top_k: usize,
+    max_cloud_cover: f64,
+    concurrency: usize,
+    endpoint: String,
+    disk_cache: Option<String>,
+    scout_factor: u32,
+    bands_subset: Option<Vec<String>>,
+) -> anyhow::Result<Vec<PeriodResult>> {
+    use anyhow::Context;
+    use futures::stream::{FuturesUnordered, StreamExt};
+    use std::time::Instant;
+
+    let cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(2);
+    let safe_concurrency = (cpus.saturating_mul(50)).max(50);
+    let effective_concurrency = concurrency.min(safe_concurrency);
+
+    // Sort + dedup years/months, build period list in (year, month) order.
+    let mut years_sorted = years.clone();
+    years_sorted.sort();
+    years_sorted.dedup();
+    let mut months_sorted = months.clone();
+    months_sorted.sort();
+    months_sorted.dedup();
+    let periods: Vec<(u32, u32)> = years_sorted
+        .iter()
+        .flat_map(|y| months_sorted.iter().map(move |m| (*y, *m)))
+        .collect();
+    let min_year = *years_sorted.first().unwrap();
+    let max_year = *years_sorted.last().unwrap();
+    let min_month = *months_sorted.first().unwrap();
+    let max_month = *months_sorted.last().unwrap();
+    // STAC handles "yyyy-mm-31" gracefully even for Feb — extra day yields
+    // zero items. Avoids dealing with leap years and DST nonsense.
+    let full_datetime = format!(
+        "{min_year:04}-{min_month:02}-01/{max_year:04}-{max_month:02}-31"
+    );
+
+    let rt = shared_runtime();
+    rt.block_on(async move {
+        let endpoint_kind = if endpoint == "auto" {
+            auto_pick()
+        } else {
+            EndpointKind::parse(&endpoint)?
+        };
+        let endpoint = shared_endpoint(endpoint_kind);
+        let grid = if endpoint.uses_modis_sinusoidal() {
+            GridSpec::from_wgs84_bounds_modis_sinu(bbox, resolution)
+        } else {
+            GridSpec::from_wgs84_bounds(bbox, resolution)
+        };
+
+        let http = shared_http();
+        let request_semaphore =
+            Arc::new(tokio::sync::Semaphore::new(effective_concurrency.max(1)));
+        let cache = disk_cache.as_ref().map(|p| DiskCache::new(PathBuf::from(p)));
+
+        let t_total = Instant::now();
+        let collections_key = endpoint.collections_key();
+        let cloud_cover_filter = if endpoint.supports_cloud_cover_filter() {
+            Some(max_cloud_cover)
+        } else {
+            None
+        };
+
+        // 1. ONE STAC search across the union datetime range.
+        let t = Instant::now();
+        let stac = StacClient::new(
+            &endpoint.stac_url,
+            endpoint.collections.clone(),
+            bbox,
+            full_datetime.clone(),
+            cloud_cover_filter,
+        )?;
+        let raw_items = if let Some(c) = &cache {
+            let key = c.search_key(
+                &endpoint.stac_url,
+                &collections_key,
+                bbox,
+                &full_datetime,
+                cloud_cover_filter,
+            );
+            match c.load_search(&key)? {
+                Some(items) => items,
+                None => {
+                    let fresh = stac.search_raw().await.context("STAC search")?;
+                    c.store_search(&key, &fresh)?;
+                    fresh
+                }
+            }
+        } else {
+            stac.search_raw().await.context("STAC search")?
+        };
+        let signed_items: Vec<serde_json::Value> = {
+            let mut signed = Vec::with_capacity(raw_items.len());
+            for raw in raw_items {
+                signed.push(endpoint.sign_item(&http, raw).await?);
+            }
+            signed
+        };
+        let items = StacClient::items_from_raw(signed_items);
+        let dt_list = t.elapsed().as_secs_f64();
+
+        // 2. Scout each scene once. The scout result is geometry-based
+        // and doesn't care about the time window; one scout per scene
+        // covers every period it could feed into.
+        let t = Instant::now();
+        let coarse_resolution = resolution * scout_factor as f64;
+        let mut stats_map: HashMap<String, crate::pipeline::SceneStats> = HashMap::new();
+        let mut to_scout: Vec<crate::stac::StacItem> = Vec::new();
+        let gsig =
+            grid_signature(grid.bounds, grid.epsg, grid.resolution, grid.width, grid.height);
+        if let Some(c) = &cache {
+            for item in &items {
+                let key = c.scout_key(
+                    &endpoint.stac_url,
+                    &collections_key,
+                    &item.id,
+                    &gsig,
+                    512,
+                    scout_factor,
+                );
+                if let Some(cached) = c.load_scout(&key)? {
+                    let usable = cached
+                        .iter()
+                        .map(|s| s.usable_fraction)
+                        .fold(0.0_f32, |a, b| a.max(b));
+                    let mean_clear = cached
+                        .iter()
+                        .map(|s| s.mean_clear)
+                        .filter(|v| v.is_finite())
+                        .fold(f32::NAN, |a, b| if a.is_finite() { a.max(b) } else { b });
+                    stats_map.insert(
+                        item.id.clone(),
+                        crate::pipeline::SceneStats {
+                            item_id: item.id.clone(),
+                            usable_fraction: usable,
+                            mean_clear,
+                        },
+                    );
+                    continue;
+                }
+                to_scout.push(item.clone());
+            }
+        } else {
+            to_scout.extend(items.iter().cloned());
+        }
+        let quality_kind = endpoint.quality_kind;
+        let mut scout_tasks = FuturesUnordered::new();
+        for item in to_scout {
+            let http = http.clone();
+            let grid = grid.clone();
+            let sem = request_semaphore.clone();
+            let quality_asset = match endpoint.quality_asset_for(&item.collection) {
+                Some(a) => a.to_string(),
+                None => continue,
+            };
+            scout_tasks.push(tokio::spawn(async move {
+                scout_scene(
+                    http,
+                    &item,
+                    &grid,
+                    coarse_resolution,
+                    sem,
+                    &quality_asset,
+                    quality_kind,
+                )
+                .await
+            }));
+        }
+        let scout_cache = cache.clone();
+        while let Some(res) = scout_tasks.next().await {
+            match res {
+                Ok(Ok(s)) => {
+                    if let Some(c) = &scout_cache {
+                        let key = c.scout_key(
+                            &endpoint.stac_url,
+                            &collections_key,
+                            &s.item_id,
+                            &gsig,
+                            512,
+                            scout_factor,
+                        );
+                        let stat = crate::pipeline::SceneChunkStat {
+                            chunk_id: 0,
+                            usable_fraction: s.usable_fraction,
+                            mean_clear: s.mean_clear,
+                        };
+                        let _ = c.store_scout(&key, &[stat]);
+                    }
+                    stats_map.insert(s.item_id.clone(), s);
+                }
+                Ok(Err(e)) => eprintln!("scout error: {e}"),
+                Err(e) => eprintln!("scout task panic: {e}"),
+            }
+        }
+        let dt_scout = t.elapsed().as_secs_f64();
+
+        // Band-name resolution (same for every period).
+        let band_names_out: Vec<String> = if let Some(subset) = bands_subset.as_ref() {
+            let supported: HashMap<&str, ()> = endpoint
+                .band_names_supported
+                .iter()
+                .copied()
+                .map(|n| (n, ()))
+                .collect();
+            for n in subset {
+                if !supported.contains_key(n.as_str()) {
+                    anyhow::bail!(
+                        "band {n:?} not supported by endpoint {:?}; valid: {:?}",
+                        endpoint.kind,
+                        endpoint.band_names_supported
+                    );
+                }
+            }
+            subset.clone()
+        } else {
+            endpoint
+                .band_names_supported
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect()
+        };
+
+        // 3. Compose per (year, month). Each period's fetch is
+        // independent; spawn them concurrently and let the shared
+        // connection pool / semaphore arbitrate. Periods that share
+        // tiles benefit from the OS page cache + reqwest connection
+        // reuse without any explicit sharing in our code.
+        let endpoint_arc = endpoint.clone();
+        let http_arc = http.clone();
+        let sem_arc = request_semaphore.clone();
+        let band_names_arc = Arc::new(band_names_out);
+        let items_arc = Arc::new(items);
+        let stats_arc = Arc::new(stats_map);
+
+        let mut period_tasks = Vec::with_capacity(periods.len());
+        for (year, month) in periods {
+            let endpoint = endpoint_arc.clone();
+            let http = http_arc.clone();
+            let sem = sem_arc.clone();
+            let band_names = band_names_arc.clone();
+            let items = items_arc.clone();
+            let stats = stats_arc.clone();
+            let grid = grid.clone();
+            period_tasks.push(tokio::spawn(async move {
+                compose_one_period(
+                    year,
+                    month,
+                    items.as_ref(),
+                    stats.as_ref(),
+                    &grid,
+                    endpoint.as_ref(),
+                    http,
+                    sem,
+                    band_names.as_ref(),
+                    top_k,
+                )
+                .await
+                .map(|build| PeriodResult { year, month, build })
+            }));
+        }
+
+        let mut results: Vec<PeriodResult> = Vec::with_capacity(period_tasks.len());
+        let mut errs: Vec<String> = Vec::new();
+        for task in period_tasks {
+            match task.await {
+                Ok(Ok(r)) => results.push(r),
+                Ok(Err(e)) => errs.push(format!("period err: {e:#}")),
+                Err(e) => errs.push(format!("period panic: {e}")),
+            }
+        }
+        if results.is_empty() && !errs.is_empty() {
+            anyhow::bail!("all periods failed:\n  {}", errs.join("\n  "));
+        }
+        // Sort by (year, month) for stable output ordering.
+        results.sort_by_key(|r| (r.year, r.month));
+
+        tracing::info!(
+            list_scenes = dt_list,
+            scout = dt_scout,
+            periods = results.len(),
+            total = t_total.elapsed().as_secs_f64(),
+            "build_monthly_composites finished",
+        );
+        Ok::<Vec<PeriodResult>, anyhow::Error>(results)
+    })
+}
+
+/// Fetch + compose for a single (year, month) period using
+/// pre-scouted shared item / stats data. Returns one BuildResult.
+#[allow(clippy::too_many_arguments)]
+async fn compose_one_period(
+    year: u32,
+    month: u32,
+    items: &[crate::stac::StacItem],
+    stats: &HashMap<String, crate::pipeline::SceneStats>,
+    grid: &GridSpec,
+    endpoint: &EndpointConfig,
+    http: Arc<reqwest::Client>,
+    sem: Arc<tokio::sync::Semaphore>,
+    band_names_out: &[String],
+    top_k: usize,
+) -> anyhow::Result<BuildResult> {
+    use futures::stream::{FuturesUnordered, StreamExt};
+    use std::time::Instant;
+    let t_total = Instant::now();
+    let mut timings: HashMap<String, f64> = HashMap::new();
+
+    // Filter items to this period.
+    let prefix = format!("{year:04}-{month:02}");
+    let period_items: Vec<crate::stac::StacItem> = items
+        .iter()
+        .filter(|it| it.datetime.starts_with(&prefix))
+        .cloned()
+        .collect();
+
+    // Partition + select (same as run_build).
+    let chunks = chunks_from_grid(grid.bounds, grid.resolution, (grid.width, grid.height), 512);
+    let scene_geoms: Vec<(usize, String, serde_json::Value)> = period_items
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| !s.mgrs_tile.is_empty() && !s.geometry.is_null())
+        .map(|(idx, s)| (idx, s.mgrs_tile.clone(), s.geometry.clone()))
+        .collect();
+    let partition = build_partition(
+        &chunks,
+        &grid.proj_def(),
+        &scene_geoms,
+        1,
+        (grid.resolution * grid.resolution) as f64,
+    )?;
+    let picks = if let Some(p) = &partition {
+        select_chunk_tile_aware(&period_items, stats, p, top_k)
+    } else {
+        select_top_k(&period_items, stats, top_k)
+    };
+
+    // Fetch + compose, mirroring run_build's loop.
+    let t = Instant::now();
+    let quality_kind = endpoint.quality_kind;
+    let scenes_for_fetch: Vec<crate::stac::StacItem> =
+        picks.iter().map(|p| p.scene.clone()).collect();
+    let mut band_tasks = FuturesUnordered::new();
+    for (scene_idx, scene) in scenes_for_fetch.iter().enumerate() {
+        for (band_idx, band_name) in band_names_out.iter().enumerate() {
+            let Some(asset) = endpoint.asset_for(&scene.collection, band_name) else {
+                continue;
+            };
+            let asset = asset.to_string();
+            let scene = scene.clone();
+            let http = http.clone();
+            let grid = grid.clone();
+            let sem = sem.clone();
+            band_tasks.push(tokio::spawn(async move {
+                let res = fetch_band(http, &scene, &asset, &grid, sem).await?;
+                Ok::<(usize, usize, Option<Vec<u16>>), anyhow::Error>((
+                    scene_idx, band_idx, res,
+                ))
+            }));
+        }
+        let Some(quality_asset) = endpoint.quality_asset_for(&scene.collection) else {
+            continue;
+        };
+        let quality_asset = quality_asset.to_string();
+        let scene = scene.clone();
+        let http = http.clone();
+        let grid = grid.clone();
+        let sem = sem.clone();
+        band_tasks.push(tokio::spawn(async move {
+            let res = fetch_quality(http, &scene, &grid, sem, &quality_asset).await?;
+            Ok::<(usize, usize, Option<Vec<u16>>), anyhow::Error>((
+                scene_idx,
+                usize::MAX,
+                res.map(|q| q.iter().map(|&b| b as u16).collect()),
+            ))
+        }));
+    }
+    let mut bands_by_scene: Vec<Vec<Option<Vec<u16>>>> =
+        vec![vec![None; band_names_out.len()]; scenes_for_fetch.len()];
+    let mut quality_by_scene: Vec<Option<Vec<u8>>> = vec![None; scenes_for_fetch.len()];
+    while let Some(res) = band_tasks.next().await {
+        match res {
+            Ok(Ok((scene_idx, band_idx, data))) => {
+                if band_idx == usize::MAX {
+                    quality_by_scene[scene_idx] =
+                        data.map(|v| v.iter().map(|&x| x as u8).collect());
+                } else {
+                    bands_by_scene[scene_idx][band_idx] = data;
+                }
+            }
+            Ok(Err(e)) => eprintln!("fetch error: {e}"),
+            Err(e) => eprintln!("fetch task panic: {e}"),
+        }
+    }
+    let mut observations: Vec<(String, Vec<Vec<u16>>, Vec<u8>)> = Vec::new();
+    for (idx, scene) in scenes_for_fetch.iter().enumerate() {
+        let quality = match quality_by_scene[idx].take() {
+            Some(v) => v,
+            None => continue,
+        };
+        let mut bands_data = Vec::with_capacity(band_names_out.len());
+        let mut ok = true;
+        for b in 0..band_names_out.len() {
+            match bands_by_scene[idx][b].take() {
+                Some(d) => bands_data.push(d),
+                None => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if !ok {
+            continue;
+        }
+        observations.push((scene.id.clone(), bands_data, quality));
+    }
+    timings.insert("fetch".to_string(), t.elapsed().as_secs_f64());
+
+    let t = Instant::now();
+    let composite =
+        compose_best_pixel(grid, band_names_out.len(), observations, quality_kind);
+    timings.insert("compose".to_string(), t.elapsed().as_secs_f64());
+    timings.insert("total".to_string(), t_total.elapsed().as_secs_f64());
+
+    let partition_tiles = partition
+        .as_ref()
+        .map(|p| p.tiles.clone())
+        .unwrap_or_default();
+    let multi_tile_chunks = partition
+        .as_ref()
+        .map(|p| {
+            p.requirements
+                .values()
+                .filter(|r| r.required_tiles.len() > 1)
+                .count()
+        })
+        .unwrap_or(0);
+
+    Ok(BuildResult {
+        grid: grid.clone(),
+        bands: composite.bands,
+        band_names: band_names_out.to_vec(),
+        quality: composite.quality,
+        observation_count: composite.observation_count,
+        selected_observation: composite.selected_observation,
+        source_ids: composite.source_ids,
+        timings,
+        endpoint_url: endpoint.stac_url.clone(),
+        collection: endpoint.collections_key(),
+        partition_tiles,
+        multi_tile_chunks,
+    })
+}
+
 fn encode_result(py: Python<'_>, r: BuildResult) -> PyResult<Bound<'_, PyDict>> {
     let out = PyDict::new_bound(py);
 
@@ -606,8 +1133,23 @@ fn encode_result(py: Python<'_>, r: BuildResult) -> PyResult<Bound<'_, PyDict>> 
     Ok(out)
 }
 
+fn encode_period_results(
+    py: Python<'_>,
+    results: Vec<PeriodResult>,
+) -> PyResult<Bound<'_, PyList>> {
+    let out = PyList::empty_bound(py);
+    for r in results {
+        let dict = encode_result(py, r.build)?;
+        dict.set_item("year", r.year)?;
+        dict.set_item("month", r.month)?;
+        out.append(dict)?;
+    }
+    Ok(out)
+}
+
 #[pymodule]
 fn surface_priors_rs(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(build_composite, m)?)?;
+    m.add_function(wrap_pyfunction!(build_monthly_composites, m)?)?;
     Ok(())
 }

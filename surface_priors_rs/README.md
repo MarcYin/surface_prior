@@ -85,6 +85,32 @@ resampling) all the way through, so quality buckets stay categorical.
 Pass `bands=None` (or omit) to fetch all bands the endpoint supports
 (12 for S2 L2A, 7 for HLS).
 
+### Multi-month / multi-year batches
+
+`build_monthly_composites(bbox, years=[...], months=[...], ...)`
+produces one composite per `(year, month)` combination from a single
+STAC search + scout pass. Cleaner than looping `build_composite` in
+Python, and faster because the search + scout work is amortised.
+
+```python
+out = spx.build_monthly_composites(
+    bbox=(30.5, 30.5, 31.6, 31.5),
+    years=[2018, 2019, 2020],
+    months=[6, 7, 8],          # June / July / August
+    resolution=60.0,
+    top_k=3,
+    endpoint="pc",
+)
+# 9 composites returned as a list, each carrying its own year/month:
+for r in out:
+    print(r["year"], r["month"], r["bands"]["red"].shape)
+```
+
+Per-period tasks are spawned concurrently on the shared runtime, so
+the 9-period example above runs in ~22 s wall — about the same as
+sequential `build_composite` calls but with one STAC search instead
+of nine.
+
 ### Harmonized Landsat-Sentinel-2 (HLS)
 
 `endpoint="hls"` pulls from PC's `hls2-l30` + `hls2-s30` collections
