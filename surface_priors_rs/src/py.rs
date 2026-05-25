@@ -13,13 +13,42 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use ndarray::Array2;
 use numpy::IntoPyArray;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
+use tokio::runtime::Runtime;
+
+/// Process-global tokio runtime. Rebuilding the runtime per call costs
+/// ~3 s of drop overhead because reqwest's idle connection pool has
+/// to close 256+ TLS sessions; reusing one runtime across all
+/// build_composite() calls avoids that entirely. Block_on is safe to
+/// call from multiple Python threads on the same runtime — the worker
+/// pool services all parallel futures.
+fn shared_runtime() -> &'static Runtime {
+    static RT: OnceLock<Runtime> = OnceLock::new();
+    RT.get_or_init(|| {
+        let cpus = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(2);
+        if cpus <= 1 {
+            // current_thread runtime still works with block_on from
+            // the same OS thread, but multiple Python threads calling
+            // build_composite would serialize. Single-CPU runs are
+            // unusual so we accept that.
+            Runtime::new().expect("tokio runtime")
+        } else {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(cpus.max(2))
+                .enable_all()
+                .build()
+                .expect("tokio runtime")
+        }
+    })
+}
 
 use crate::disk_cache::{grid_signature, DiskCache};
 use crate::endpoint::{auto_pick, EndpointConfig, EndpointKind};
@@ -109,16 +138,8 @@ fn run_build(
     let safe_concurrency = (cpus.saturating_mul(50)).max(50);
     let effective_concurrency = concurrency.min(safe_concurrency);
 
-    let rt = if cpus <= 1 {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?
-    } else {
-        tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(cpus.max(2))
-            .enable_all()
-            .build()?
-    };
+    // Reuse the shared runtime — see shared_runtime() for why.
+    let rt = shared_runtime();
     rt.block_on(async move {
         let endpoint_kind = if endpoint == "auto" {
             auto_pick()
@@ -187,8 +208,10 @@ fn run_build(
         } else {
             stac.search_raw().await.context("STAC search")?
         };
+        let t_list = t.elapsed().as_secs_f64();
         // Sign for PC / HLS if needed (anonymous endpoints pass through
         // sign_item unchanged).
+        let t_sign = Instant::now();
         let signed_items: Vec<serde_json::Value> = {
             let mut signed = Vec::with_capacity(raw_items.len());
             for raw in raw_items {
@@ -197,7 +220,8 @@ fn run_build(
             signed
         };
         let items = StacClient::items_from_raw(signed_items);
-        timings.insert("list_scenes".to_string(), t.elapsed().as_secs_f64());
+        timings.insert("list_scenes".to_string(), t_list);
+        timings.insert("sign".to_string(), t_sign.elapsed().as_secs_f64());
 
         // 2. scout
         let t = Instant::now();
@@ -302,6 +326,7 @@ fn run_build(
         timings.insert("scout".to_string(), t.elapsed().as_secs_f64());
 
         // 3. tile partition + select
+        let t_part = Instant::now();
         let chunks =
             chunks_from_grid(grid.bounds, grid.resolution, (grid.width, grid.height), 512);
         let scene_geoms: Vec<(usize, String, serde_json::Value)> = items
@@ -322,6 +347,7 @@ fn run_build(
         } else {
             select_top_k(&items, &stats_map, top_k)
         };
+        timings.insert("partition".to_string(), t_part.elapsed().as_secs_f64());
 
         // 4. fetch
         let t = Instant::now();
@@ -466,7 +492,7 @@ fn run_build(
             .unwrap_or(0);
 
         Ok::<BuildResult, anyhow::Error>(BuildResult {
-            grid,
+            grid: grid.clone(),
             bands: composite.bands,
             band_names: band_names_out,
             quality: composite.quality,
