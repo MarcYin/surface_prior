@@ -43,7 +43,7 @@ const COMPRESSION_NONE: u32 = 1;
 const COMPRESSION_DEFLATE: u32 = 8;
 const COMPRESSION_ADOBE_DEFLATE: u32 = 32946;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SampleFormat {
     UInt8,
     UInt16,
@@ -58,7 +58,7 @@ impl SampleFormat {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct OverviewLevel {
     pub width: u32,
     pub height: u32,
@@ -121,7 +121,7 @@ pub struct TileRequest {
     pub byte_count: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CogProfile {
     pub url: String,
     pub width: u32,
@@ -165,27 +165,68 @@ impl CogProfile {
     }
 }
 
-/// Process-wide cache of parsed COG profiles, keyed by URL. Eliminates
-/// duplicate header GETs when the same COG is opened in multiple
-/// phases (e.g. scout opens SCL coarse, fetch_quality opens it full-
-/// res; both can share the same parsed profile).
+/// Process-wide cache of parsed COG profiles, keyed by URL path
+/// (no query string). Eliminates duplicate header GETs across phases
+/// (e.g. scout opens SCL coarse, fetch_quality opens it full-res; both
+/// share the parsed profile). Keyed by path-only so SAS-token rotation
+/// doesn't bust the cache.
 fn cog_profile_cache() -> &'static dashmap::DashMap<String, std::sync::Arc<CogProfile>> {
     static CACHE: std::sync::OnceLock<dashmap::DashMap<String, std::sync::Arc<CogProfile>>> =
         std::sync::OnceLock::new();
     CACHE.get_or_init(dashmap::DashMap::new)
 }
 
-/// Open a COG over HTTP, returning the parsed profile. Uses an
-/// in-process cache to avoid re-fetching the header for the same URL.
+fn url_path_key(url: &str) -> &str {
+    url.split_once('?').map(|(p, _)| p).unwrap_or(url)
+}
+
+/// Process-global disk cache backend for parsed COG headers. Set by
+/// the pipeline's bootstrap (run_build / run_build_periods) when the
+/// caller passes a `disk_cache` directory; null otherwise.
+fn cog_disk_cache_slot() -> &'static parking_lot::RwLock<Option<crate::disk_cache::DiskCache>> {
+    static SLOT: std::sync::OnceLock<
+        parking_lot::RwLock<Option<crate::disk_cache::DiskCache>>,
+    > = std::sync::OnceLock::new();
+    SLOT.get_or_init(|| parking_lot::RwLock::new(None))
+}
+
+/// Install (or remove) the disk-cache backend that `open_cog` should
+/// consult before issuing a header fetch. Idempotent; calling with
+/// `None` disables disk persistence (in-memory cache still works).
+pub fn set_cog_disk_cache(cache: Option<crate::disk_cache::DiskCache>) {
+    *cog_disk_cache_slot().write() = cache;
+}
+
+/// Open a COG over HTTP, returning the parsed profile. Three-tier
+/// cache: in-memory dashmap → disk (if configured) → HTTP fetch.
 pub async fn open_cog(http: &reqwest::Client, url: &str) -> Result<std::sync::Arc<CogProfile>> {
     let cache = cog_profile_cache();
-    if let Some(profile) = cache.get(url) {
+    let key = url_path_key(url).to_string();
+    if let Some(profile) = cache.get(&key) {
         return Ok(profile.clone());
+    }
+    // Try the on-disk cache before going to the network.
+    if let Some(dc) = cog_disk_cache_slot().read().clone() {
+        let disk_key = dc.cog_profile_key(url);
+        if let Ok(Some(mut p)) = dc.load_cog_profile(&disk_key) {
+            // The stored profile keeps the URL it was first saved
+            // with; refresh it so callers always see the current href.
+            p.url = url.to_string();
+            let arc = std::sync::Arc::new(p);
+            cache.insert(key.clone(), arc.clone());
+            return Ok(arc);
+        }
     }
     // Header fetch — most COGs fit IFD0 + SubIFDs in the first 64 KiB.
     let header = http_range_get(http, url, 0, HEADER_RANGE - 1).await?;
     let profile = std::sync::Arc::new(parse_cog(http, url, header).await?);
-    cache.insert(url.to_string(), profile.clone());
+    cache.insert(key, profile.clone());
+    // Best-effort write-through to disk; tolerate failures silently
+    // since the in-memory cache still works.
+    if let Some(dc) = cog_disk_cache_slot().read().clone() {
+        let disk_key = dc.cog_profile_key(url);
+        let _ = dc.store_cog_profile(&disk_key, &profile);
+    }
     Ok(profile)
 }
 

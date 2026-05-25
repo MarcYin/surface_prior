@@ -259,6 +259,9 @@ fn run_build(
         let request_semaphore =
             Arc::new(tokio::sync::Semaphore::new(effective_concurrency.max(1)));
         let cache = disk_cache.as_ref().map(|p| DiskCache::new(PathBuf::from(p)));
+        // Hook the same disk cache into the COG header reader so the
+        // 64 KiB header GET is skipped on warm runs.
+        crate::cog::set_cog_disk_cache(cache.clone());
 
         let mut timings: HashMap<String, f64> = HashMap::new();
         let t_total = Instant::now();
@@ -669,6 +672,7 @@ fn run_build_periods(
         let request_semaphore =
             Arc::new(tokio::sync::Semaphore::new(effective_concurrency.max(1)));
         let cache = disk_cache.as_ref().map(|p| DiskCache::new(PathBuf::from(p)));
+        crate::cog::set_cog_disk_cache(cache.clone());
 
         let t_total = Instant::now();
         let collections_key = endpoint.collections_key();

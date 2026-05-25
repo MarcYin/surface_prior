@@ -127,6 +127,30 @@ impl DiskCache {
         self.store_slice(self.path("scout", key), stats)
     }
 
+    /// Stable key for caching a COG's parsed header. Hashes only the
+    /// URL path (scheme+host+path), so SAS-token rotation on PC
+    /// hrefs doesn't bust the cache.
+    pub fn cog_profile_key(&self, url: &str) -> String {
+        use sha1::{Digest, Sha1};
+        let path_only = url.split_once('?').map(|(p, _)| p).unwrap_or(url);
+        let mut h = Sha1::new();
+        h.update(b"schema:1\0cog\0");
+        h.update(path_only.as_bytes());
+        hex::encode(h.finalize())
+    }
+
+    pub fn load_cog_profile(&self, key: &str) -> Result<Option<crate::cog::CogProfile>> {
+        self.load_at(self.path("cog", key))
+    }
+
+    pub fn store_cog_profile(
+        &self,
+        key: &str,
+        profile: &crate::cog::CogProfile,
+    ) -> Result<()> {
+        self.store_at(self.path("cog", key), profile)
+    }
+
     fn store_slice<T: Serialize + Clone>(&self, path: PathBuf, slice: &[T]) -> Result<()> {
         let owned: Vec<T> = slice.to_vec();
         self.store_at(path, &owned)

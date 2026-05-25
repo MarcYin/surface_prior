@@ -170,6 +170,7 @@ async fn async_main() -> Result<()> {
     let request_semaphore = Arc::new(tokio::sync::Semaphore::new(effective_concurrency.max(1)));
 
     let cache = cli.disk_cache.as_ref().map(|p| DiskCache::new(p));
+    surface_priors_rs::cog::set_cog_disk_cache(cache.clone());
     let _grid_sig = grid_signature(grid.bounds, grid.epsg, grid.resolution, grid.width, grid.height);
 
     // --- List scenes -------------------------------------------------------
