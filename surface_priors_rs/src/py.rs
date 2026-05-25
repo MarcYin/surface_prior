@@ -50,6 +50,44 @@ fn shared_runtime() -> &'static Runtime {
     })
 }
 
+/// Process-global reqwest::Client. Each call previously built a fresh
+/// Client with `pool_max_idle_per_host(256)`; reusing one client keeps
+/// HTTP/2 + TLS connections warm across calls and across STAC + tile
+/// + SAS endpoints alike.
+fn shared_http() -> Arc<reqwest::Client> {
+    static HTTP: OnceLock<Arc<reqwest::Client>> = OnceLock::new();
+    HTTP.get_or_init(|| {
+        Arc::new(
+            reqwest::Client::builder()
+                .gzip(true)
+                .http2_adaptive_window(true)
+                .pool_max_idle_per_host(256)
+                .tcp_keepalive(std::time::Duration::from_secs(60))
+                .tcp_nodelay(true)
+                .build()
+                .expect("reqwest client"),
+        )
+    })
+    .clone()
+}
+
+/// Process-global EndpointConfig per kind. Caches PC SAS tokens across
+/// calls so the second call doesn't re-fetch them. EndpointConfig is
+/// internally Send + Sync; its sas_tokens_per_container is a RwLock so
+/// concurrent calls from multiple Python threads share the cache
+/// without contention.
+fn shared_endpoint(kind: EndpointKind) -> Arc<EndpointConfig> {
+    use std::sync::Mutex;
+    static CACHE: OnceLock<Mutex<HashMap<EndpointKind, Arc<EndpointConfig>>>> =
+        OnceLock::new();
+    let map = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = map.lock().expect("endpoint cache poisoned");
+    guard
+        .entry(kind)
+        .or_insert_with(|| Arc::new(EndpointConfig::build(kind)))
+        .clone()
+}
+
 use crate::disk_cache::{grid_signature, DiskCache};
 use crate::endpoint::{auto_pick, EndpointConfig, EndpointKind};
 use crate::grid::GridSpec;
@@ -146,7 +184,10 @@ fn run_build(
         } else {
             EndpointKind::parse(&endpoint)?
         };
-        let endpoint = Arc::new(EndpointConfig::build(endpoint_kind));
+        // Both endpoint config (SAS token cache) and reqwest client
+        // (connection pool) are shared across all calls in this
+        // process — see shared_endpoint() / shared_http().
+        let endpoint = shared_endpoint(endpoint_kind);
         // MCD43A4 stays in MODIS Sinusoidal end-to-end; everything else
         // outputs in UTM derived from the AOI centroid.
         let grid = if endpoint.uses_modis_sinusoidal() {
@@ -155,15 +196,7 @@ fn run_build(
             GridSpec::from_wgs84_bounds(bbox, resolution)
         };
 
-        let http = Arc::new(
-            reqwest::Client::builder()
-                .gzip(true)
-                .http2_adaptive_window(true)
-                .pool_max_idle_per_host(256)
-                .tcp_keepalive(std::time::Duration::from_secs(60))
-                .tcp_nodelay(true)
-                .build()?,
-        );
+        let http = shared_http();
         let request_semaphore =
             Arc::new(tokio::sync::Semaphore::new(effective_concurrency.max(1)));
         let cache = disk_cache.as_ref().map(|p| DiskCache::new(PathBuf::from(p)));
