@@ -228,6 +228,18 @@ impl EndpointConfig {
         matches!(self.kind, EndpointKind::Modis43A4)
     }
 
+    /// PROJ-readable CRS string for this endpoint's source COGs. For
+    /// MCD43A4 this is MODIS Sinusoidal; for S2/HLS the source CRS
+    /// varies per-scene UTM zone, so we return None — the existing
+    /// same-CRS resampler handles those because the pipeline picks
+    /// the target UTM zone to match the AOI.
+    pub fn source_proj(&self) -> Option<&'static str> {
+        match self.kind {
+            EndpointKind::Modis43A4 => Some(crate::grid::MODIS_SINU_PROJ4),
+            _ => None,
+        }
+    }
+
     pub fn earth_search() -> Self {
         let band_to_asset = [
             ("coastal", "coastal"),

@@ -14,7 +14,10 @@ use std::time::Instant;
 
 use crate::cog::{open_cog, read_tiles, stitch_tiles, CogProfile, PixelWindow, SampleFormat};
 use crate::endpoint::QualityKind;
-use crate::grid::{cog_window_for_utm, resample_u16_to_u16, resample_u8_to_u8, GridSpec};
+use crate::grid::{
+    cog_window_for_utm, reproject_u16_to_u16, reproject_u8_to_u8, resample_u16_to_u16,
+    resample_u8_to_u8, GridSpec,
+};
 use crate::stac::StacItem;
 
 /// Per-(scene, chunk) statistics; cached on disk via [`crate::disk_cache`].
@@ -61,6 +64,7 @@ pub async fn scout_scene(
     semaphore: Arc<tokio::sync::Semaphore>,
     quality_asset: &str,
     quality_kind: QualityKind,
+    source_proj: Option<&str>,
 ) -> Result<SceneStats> {
     let url = scene
         .assets
@@ -83,12 +87,20 @@ pub async fn scout_scene(
         .tie_point
         .map(|t| [t[3], t[4]])
         .unwrap_or([0.0, 0.0]);
+    let grid_proj = grid.proj_def();
+    let cross_crs = source_proj.is_some() && source_proj.unwrap() != grid_proj;
+    let source_bounds = if cross_crs {
+        crate::projx::transform_bounds(&grid_proj, source_proj.unwrap(), grid.bounds, 21)
+            .map_err(|e| anyhow::anyhow!("grid->source bounds transform: {e}"))?
+    } else {
+        grid.bounds
+    };
     let win = match cog_window_for_utm(
         origin,
         pixel_size,
         level.width,
         level.height,
-        grid.bounds,
+        source_bounds,
     ) {
         Some(w) => w,
         None => {
@@ -123,15 +135,29 @@ pub async fn scout_scene(
         origin[1] - win.row_off as f64 * pixel_size,
     ];
     let dst_origin = [grid.bounds[0], grid.bounds[3]];
-    let quality_buf = resample_u8_to_u8(
-        &buf,
-        (win.width, win.height),
-        level_origin,
-        pixel_size,
-        (dst_w, dst_h),
-        dst_origin,
-        grid.resolution,
-    )?;
+    let quality_buf = if cross_crs {
+        reproject_u8_to_u8(
+            &buf,
+            (win.width, win.height),
+            level_origin,
+            pixel_size,
+            source_proj.unwrap(),
+            (dst_w, dst_h),
+            dst_origin,
+            grid.resolution,
+            &grid_proj,
+        )?
+    } else {
+        resample_u8_to_u8(
+            &buf,
+            (win.width, win.height),
+            level_origin,
+            pixel_size,
+            (dst_w, dst_h),
+            dst_origin,
+            grid.resolution,
+        )?
+    };
     let (usable, mean_clear) = quality_to_stats(&quality_buf, quality_kind);
     Ok(SceneStats {
         item_id: scene.id.clone(),
@@ -292,6 +318,7 @@ pub async fn fetch_band(
     band_asset: &str,
     grid: &GridSpec,
     semaphore: Arc<tokio::sync::Semaphore>,
+    source_proj: Option<&str>,
 ) -> Result<Option<Vec<u16>>> {
     let url = match scene.assets.get(band_asset) {
         Some(u) => u.clone(),
@@ -315,12 +342,23 @@ pub async fn fetch_band(
         .tie_point
         .map(|t| [t[3], t[4]])
         .unwrap_or([0.0, 0.0]);
+    // Cross-CRS path: source CRS (from endpoint config) differs from
+    // the target grid CRS, so we need to transform the grid bounds
+    // into source coords before sizing the COG window.
+    let grid_proj = grid.proj_def();
+    let cross_crs = source_proj.is_some() && source_proj.unwrap() != grid_proj;
+    let source_bounds = if cross_crs {
+        crate::projx::transform_bounds(&grid_proj, source_proj.unwrap(), grid.bounds, 21)
+            .map_err(|e| anyhow::anyhow!("grid->source bounds transform: {e}"))?
+    } else {
+        grid.bounds
+    };
     let win = match cog_window_for_utm(
         origin,
         pixel_size,
         level.width,
         level.height,
-        grid.bounds,
+        source_bounds,
     ) {
         Some(w) => w,
         None => return Ok(None),
@@ -360,15 +398,29 @@ pub async fn fetch_band(
     ];
     let dst_origin = [grid.bounds[0], grid.bounds[3]];
     let t_resample = std::time::Instant::now();
-    let out = resample_u16_to_u16(
-        &src_u16,
-        (win.width, win.height),
-        level_origin,
-        pixel_size,
-        (grid.width, grid.height),
-        dst_origin,
-        grid.resolution,
-    )?;
+    let out = if cross_crs {
+        reproject_u16_to_u16(
+            &src_u16,
+            (win.width, win.height),
+            level_origin,
+            pixel_size,
+            source_proj.unwrap(),
+            (grid.width, grid.height),
+            dst_origin,
+            grid.resolution,
+            &grid_proj,
+        )?
+    } else {
+        resample_u16_to_u16(
+            &src_u16,
+            (win.width, win.height),
+            level_origin,
+            pixel_size,
+            (grid.width, grid.height),
+            dst_origin,
+            grid.resolution,
+        )?
+    };
     let dt_resample = t_resample.elapsed().as_secs_f64();
     tracing::debug!(
         band = %band_asset, n_tiles, dt_open, dt_read, dt_stitch, dt_resample,
@@ -386,6 +438,7 @@ pub async fn fetch_quality(
     grid: &GridSpec,
     semaphore: Arc<tokio::sync::Semaphore>,
     quality_asset: &str,
+    source_proj: Option<&str>,
 ) -> Result<Option<Vec<u8>>> {
     let Some(url) = scene.assets.get(quality_asset).cloned() else {
         return Ok(None);
@@ -402,12 +455,20 @@ pub async fn fetch_quality(
         .tie_point
         .map(|t| [t[3], t[4]])
         .unwrap_or([0.0, 0.0]);
+    let grid_proj = grid.proj_def();
+    let cross_crs = source_proj.is_some() && source_proj.unwrap() != grid_proj;
+    let source_bounds = if cross_crs {
+        crate::projx::transform_bounds(&grid_proj, source_proj.unwrap(), grid.bounds, 21)
+            .map_err(|e| anyhow::anyhow!("grid->source bounds transform: {e}"))?
+    } else {
+        grid.bounds
+    };
     let win = match cog_window_for_utm(
         origin,
         pixel_size,
         level.width,
         level.height,
-        grid.bounds,
+        source_bounds,
     ) {
         Some(w) => w,
         None => return Ok(None),
@@ -432,15 +493,29 @@ pub async fn fetch_quality(
         origin[1] - win.row_off as f64 * pixel_size,
     ];
     let dst_origin = [grid.bounds[0], grid.bounds[3]];
-    let scl = resample_u8_to_u8(
-        &buf,
-        (win.width, win.height),
-        level_origin,
-        pixel_size,
-        (grid.width, grid.height),
-        dst_origin,
-        grid.resolution,
-    )?;
+    let scl = if cross_crs {
+        reproject_u8_to_u8(
+            &buf,
+            (win.width, win.height),
+            level_origin,
+            pixel_size,
+            source_proj.unwrap(),
+            (grid.width, grid.height),
+            dst_origin,
+            grid.resolution,
+            &grid_proj,
+        )?
+    } else {
+        resample_u8_to_u8(
+            &buf,
+            (win.width, win.height),
+            level_origin,
+            pixel_size,
+            (grid.width, grid.height),
+            dst_origin,
+            grid.resolution,
+        )?
+    };
     Ok(Some(scl))
 }
 

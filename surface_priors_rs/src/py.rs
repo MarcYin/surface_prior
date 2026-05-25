@@ -90,6 +90,45 @@ fn shared_endpoint(kind: EndpointKind) -> Arc<EndpointConfig> {
 
 use crate::disk_cache::{grid_signature, DiskCache};
 use crate::endpoint::{auto_pick, EndpointConfig, EndpointKind};
+
+/// Build the output grid based on the caller's `output_crs` request
+/// and the endpoint's native source CRS.
+///   - "native": match the endpoint's source CRS (UTM for S2/HLS,
+///     MODIS Sinusoidal for MCD43A4).
+///   - "utm": always derive a UTM zone from the AOI centroid, even
+///     when the endpoint is MCD43A4 (requires cross-CRS reprojection
+///     in the fetch path).
+fn choose_grid(
+    endpoint: &EndpointConfig,
+    bbox: [f64; 4],
+    resolution: f64,
+    output_crs: &str,
+) -> anyhow::Result<GridSpec> {
+    match output_crs {
+        "native" => {
+            if endpoint.uses_modis_sinusoidal() {
+                Ok(GridSpec::from_wgs84_bounds_modis_sinu(bbox, resolution))
+            } else {
+                Ok(GridSpec::from_wgs84_bounds(bbox, resolution))
+            }
+        }
+        "utm" => Ok(GridSpec::from_wgs84_bounds(bbox, resolution)),
+        other => anyhow::bail!(
+            "unsupported output_crs {other:?}; valid: native, utm"
+        ),
+    }
+}
+
+/// If the endpoint's source CRS differs from the grid CRS, return
+/// the source CRS so the fetch path can reproject; otherwise None.
+fn cross_crs_source_proj(
+    endpoint: &EndpointConfig,
+    grid: &GridSpec,
+) -> Option<&'static str> {
+    endpoint
+        .source_proj()
+        .filter(|sp| *sp != grid.proj_def().as_str())
+}
 use crate::grid::GridSpec;
 use crate::pipeline::{
     compose_best_pixel, fetch_band, fetch_quality, scout_scene, select_chunk_tile_aware,
@@ -110,6 +149,7 @@ use crate::tile_classification::{build_partition, chunks_from_grid, scenes_signa
     disk_cache = None,
     scout_factor = 8,
     bands = None,
+    output_crs = "native".to_string(),
 ))]
 #[allow(clippy::too_many_arguments)]
 fn build_composite(
@@ -124,6 +164,7 @@ fn build_composite(
     disk_cache: Option<String>,
     scout_factor: u32,
     bands: Option<Vec<String>>,
+    output_crs: String,
 ) -> PyResult<Bound<'_, PyDict>> {
     // Release the GIL while the heavy async work runs — lets concurrent
     // Python threads do other things even though we block on tokio.
@@ -131,7 +172,7 @@ fn build_composite(
         .allow_threads(|| {
             run_build(
                 bbox, datetime, resolution, top_k, max_cloud_cover, concurrency, endpoint,
-                disk_cache, scout_factor, bands,
+                disk_cache, scout_factor, bands, output_crs,
             )
         })
         .map_err(|e| PyRuntimeError::new_err(format!("{e:#}")))?;
@@ -151,6 +192,7 @@ fn build_composite(
     disk_cache = None,
     scout_factor = 8,
     bands = None,
+    output_crs = "native".to_string(),
 ))]
 #[allow(clippy::too_many_arguments)]
 fn build_monthly_composites(
@@ -166,6 +208,7 @@ fn build_monthly_composites(
     disk_cache: Option<String>,
     scout_factor: u32,
     bands: Option<Vec<String>>,
+    output_crs: String,
 ) -> PyResult<Bound<'_, PyList>> {
     if years.is_empty() {
         return Err(PyRuntimeError::new_err("years must be non-empty"));
@@ -184,7 +227,7 @@ fn build_monthly_composites(
         .allow_threads(|| {
             run_build_periods(
                 bbox, years, months, resolution, top_k, max_cloud_cover, concurrency,
-                endpoint, disk_cache, scout_factor, bands,
+                endpoint, disk_cache, scout_factor, bands, output_crs,
             )
         })
         .map_err(|e| PyRuntimeError::new_err(format!("{e:#}")))?;
@@ -224,6 +267,7 @@ fn run_build(
     disk_cache: Option<String>,
     scout_factor: u32,
     bands_subset: Option<Vec<String>>,
+    output_crs: String,
 ) -> anyhow::Result<BuildResult> {
     use anyhow::Context;
     use futures::stream::{FuturesUnordered, StreamExt};
@@ -247,13 +291,9 @@ fn run_build(
         // (connection pool) are shared across all calls in this
         // process — see shared_endpoint() / shared_http().
         let endpoint = shared_endpoint(endpoint_kind);
-        // MCD43A4 stays in MODIS Sinusoidal end-to-end; everything else
-        // outputs in UTM derived from the AOI centroid.
-        let grid = if endpoint.uses_modis_sinusoidal() {
-            GridSpec::from_wgs84_bounds_modis_sinu(bbox, resolution)
-        } else {
-            GridSpec::from_wgs84_bounds(bbox, resolution)
-        };
+        let grid = choose_grid(&endpoint, bbox, resolution, &output_crs)?;
+        let source_proj_for_fetch =
+            cross_crs_source_proj(&endpoint, &grid);
 
         let http = shared_http();
         let request_semaphore =
@@ -388,6 +428,7 @@ fn run_build(
                     sem,
                     &quality_asset,
                     quality_kind,
+                    source_proj_for_fetch,
                 )
                 .await
             }));
@@ -496,7 +537,15 @@ fn run_build(
                 let grid = grid.clone();
                 let sem = request_semaphore.clone();
                 band_tasks.push(tokio::spawn(async move {
-                    let res = fetch_band(http, &scene, &asset, &grid, sem).await?;
+                    let res = fetch_band(
+                        http,
+                        &scene,
+                        &asset,
+                        &grid,
+                        sem,
+                        source_proj_for_fetch,
+                    )
+                    .await?;
                     Ok::<(usize, usize, Option<Vec<u16>>), anyhow::Error>((
                         scene_idx, band_idx, res,
                     ))
@@ -516,7 +565,15 @@ fn run_build(
             let grid = grid.clone();
             let sem = request_semaphore.clone();
             band_tasks.push(tokio::spawn(async move {
-                let res = fetch_quality(http, &scene, &grid, sem, &quality_asset).await?;
+                let res = fetch_quality(
+                    http,
+                    &scene,
+                    &grid,
+                    sem,
+                    &quality_asset,
+                    source_proj_for_fetch,
+                )
+                .await?;
                 Ok::<(usize, usize, Option<Vec<u16>>), anyhow::Error>((
                     scene_idx,
                     usize::MAX,
@@ -622,6 +679,7 @@ fn run_build_periods(
     disk_cache: Option<String>,
     scout_factor: u32,
     bands_subset: Option<Vec<String>>,
+    output_crs: String,
 ) -> anyhow::Result<Vec<PeriodResult>> {
     use anyhow::Context;
     use futures::stream::{FuturesUnordered, StreamExt};
@@ -662,11 +720,8 @@ fn run_build_periods(
             EndpointKind::parse(&endpoint)?
         };
         let endpoint = shared_endpoint(endpoint_kind);
-        let grid = if endpoint.uses_modis_sinusoidal() {
-            GridSpec::from_wgs84_bounds_modis_sinu(bbox, resolution)
-        } else {
-            GridSpec::from_wgs84_bounds(bbox, resolution)
-        };
+        let grid = choose_grid(&endpoint, bbox, resolution, &output_crs)?;
+        let source_proj_for_fetch = cross_crs_source_proj(&endpoint, &grid);
 
         let http = shared_http();
         let request_semaphore =
@@ -783,6 +838,7 @@ fn run_build_periods(
                     sem,
                     &quality_asset,
                     quality_kind,
+                    source_proj_for_fetch,
                 )
                 .await
             }));
@@ -874,6 +930,7 @@ fn run_build_periods(
                     sem,
                     band_names.as_ref(),
                     top_k,
+                    source_proj_for_fetch,
                 )
                 .await
                 .map(|build| PeriodResult { year, month, build })
@@ -920,6 +977,7 @@ async fn compose_one_period(
     sem: Arc<tokio::sync::Semaphore>,
     band_names_out: &[String],
     top_k: usize,
+    source_proj: Option<&'static str>,
 ) -> anyhow::Result<BuildResult> {
     use futures::stream::{FuturesUnordered, StreamExt};
     use std::time::Instant;
@@ -972,7 +1030,8 @@ async fn compose_one_period(
             let grid = grid.clone();
             let sem = sem.clone();
             band_tasks.push(tokio::spawn(async move {
-                let res = fetch_band(http, &scene, &asset, &grid, sem).await?;
+                let res =
+                    fetch_band(http, &scene, &asset, &grid, sem, source_proj).await?;
                 Ok::<(usize, usize, Option<Vec<u16>>), anyhow::Error>((
                     scene_idx, band_idx, res,
                 ))
@@ -987,7 +1046,15 @@ async fn compose_one_period(
         let grid = grid.clone();
         let sem = sem.clone();
         band_tasks.push(tokio::spawn(async move {
-            let res = fetch_quality(http, &scene, &grid, sem, &quality_asset).await?;
+            let res = fetch_quality(
+                http,
+                &scene,
+                &grid,
+                sem,
+                &quality_asset,
+                source_proj,
+            )
+            .await?;
             Ok::<(usize, usize, Option<Vec<u16>>), anyhow::Error>((
                 scene_idx,
                 usize::MAX,

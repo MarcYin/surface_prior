@@ -300,6 +300,7 @@ async fn async_main() -> Result<()> {
                 sem,
                 &quality_asset,
                 quality_kind,
+                None,
             )
             .await
         }));
@@ -428,7 +429,7 @@ async fn async_main() -> Result<()> {
             let grid = grid.clone();
             let sem = request_semaphore.clone();
             band_tasks.push(tokio::spawn(async move {
-                let res = fetch_band(http, &scene, &asset, &grid, sem).await?;
+                let res = fetch_band(http, &scene, &asset, &grid, sem, None).await?;
                 Ok::<(usize, usize, Option<Vec<u16>>), anyhow::Error>((scene_idx, band_idx, res))
             }));
         }
@@ -442,7 +443,7 @@ async fn async_main() -> Result<()> {
         let grid = grid.clone();
         let sem = request_semaphore.clone();
         band_tasks.push(tokio::spawn(async move {
-            let res = fetch_quality(http, &scene, &grid, sem, &quality_asset).await?;
+            let res = fetch_quality(http, &scene, &grid, sem, &quality_asset, None).await?;
             Ok::<(usize, usize, Option<Vec<u16>>), anyhow::Error>((
                 scene_idx,
                 usize::MAX,

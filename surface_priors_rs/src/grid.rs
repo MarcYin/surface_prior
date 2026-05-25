@@ -523,6 +523,125 @@ fn scalar_bilinear_pixel(
     row[c] = (v + 0.5).clamp(0.0, 65535.0) as u16;
 }
 
+/// Bilinear u16 → u16 resample with on-the-fly reprojection from a
+/// source CRS to a destination CRS. For each output pixel center we
+/// transform (dst_x, dst_y) → (src_x, src_y) via PROJ and bilinearly
+/// sample the source buffer. Pixels whose source location falls
+/// outside the source raster get `65535` (nodata).
+///
+/// Used for MCD43A4 → UTM and any other cross-CRS path where the
+/// source COG is not in the user's target grid CRS.
+#[allow(clippy::too_many_arguments)]
+pub fn reproject_u16_to_u16(
+    src: &[u16],
+    src_dim: (u32, u32),
+    src_origin: [f64; 2],
+    src_pixel_size: f64,
+    src_proj: &str,
+    dst_dim: (u32, u32),
+    dst_origin: [f64; 2],
+    dst_pixel_size: f64,
+    dst_proj: &str,
+) -> Result<Vec<u16>> {
+    let (sw, sh) = (src_dim.0 as usize, src_dim.1 as usize);
+    let (dw, dh) = (dst_dim.0 as usize, dst_dim.1 as usize);
+    if src.len() != sw * sh {
+        return Err(anyhow::anyhow!(
+            "src buffer {} != sw*sh {}",
+            src.len(),
+            sw * sh
+        ));
+    }
+    // Build all dst pixel-center coordinates in the dst CRS in one shot.
+    let mut points: Vec<(f64, f64)> = Vec::with_capacity(dw * dh);
+    for r in 0..dh {
+        let dy = dst_origin[1] - (r as f64 + 0.5) * dst_pixel_size;
+        for c in 0..dw {
+            let dx = dst_origin[0] + (c as f64 + 0.5) * dst_pixel_size;
+            points.push((dx, dy));
+        }
+    }
+    crate::projx::transform_points(dst_proj, src_proj, &mut points)?;
+
+    let mut out = vec![65535u16; dw * dh];
+    for (i, &(sx, sy)) in points.iter().enumerate() {
+        if !sx.is_finite() || !sy.is_finite() {
+            continue;
+        }
+        // Convert source CRS coords → fractional source pixel index.
+        let col_f = (sx - src_origin[0]) / src_pixel_size;
+        let row_f = (src_origin[1] - sy) / src_pixel_size;
+        let c0 = col_f.floor() as i64;
+        let r0 = row_f.floor() as i64;
+        if c0 < 0 || r0 < 0 || c0 + 1 >= sw as i64 || r0 + 1 >= sh as i64 {
+            continue;
+        }
+        let dc = col_f - c0 as f64;
+        let dr = row_f - r0 as f64;
+        let c0u = c0 as usize;
+        let r0u = r0 as usize;
+        let v00 = src[r0u * sw + c0u] as f64;
+        let v01 = src[r0u * sw + c0u + 1] as f64;
+        let v10 = src[(r0u + 1) * sw + c0u] as f64;
+        let v11 = src[(r0u + 1) * sw + c0u + 1] as f64;
+        let v = v00 * (1.0 - dc) * (1.0 - dr)
+            + v01 * dc * (1.0 - dr)
+            + v10 * (1.0 - dc) * dr
+            + v11 * dc * dr;
+        out[i] = (v + 0.5).clamp(0.0, 65535.0) as u16;
+    }
+    Ok(out)
+}
+
+/// Nearest u8 → u8 with on-the-fly reprojection. Same pattern as the
+/// u16 bilinear variant; used for SCL / Fmask / mandatory-quality
+/// rasters that must stay categorical across CRS changes.
+#[allow(clippy::too_many_arguments)]
+pub fn reproject_u8_to_u8(
+    src: &[u8],
+    src_dim: (u32, u32),
+    src_origin: [f64; 2],
+    src_pixel_size: f64,
+    src_proj: &str,
+    dst_dim: (u32, u32),
+    dst_origin: [f64; 2],
+    dst_pixel_size: f64,
+    dst_proj: &str,
+) -> Result<Vec<u8>> {
+    let (sw, sh) = (src_dim.0 as usize, src_dim.1 as usize);
+    let (dw, dh) = (dst_dim.0 as usize, dst_dim.1 as usize);
+    if src.len() != sw * sh {
+        return Err(anyhow::anyhow!(
+            "src buffer {} != sw*sh {}",
+            src.len(),
+            sw * sh
+        ));
+    }
+    let mut points: Vec<(f64, f64)> = Vec::with_capacity(dw * dh);
+    for r in 0..dh {
+        let dy = dst_origin[1] - (r as f64 + 0.5) * dst_pixel_size;
+        for c in 0..dw {
+            let dx = dst_origin[0] + (c as f64 + 0.5) * dst_pixel_size;
+            points.push((dx, dy));
+        }
+    }
+    crate::projx::transform_points(dst_proj, src_proj, &mut points)?;
+
+    let mut out = vec![0u8; dw * dh];
+    for (i, &(sx, sy)) in points.iter().enumerate() {
+        if !sx.is_finite() || !sy.is_finite() {
+            continue;
+        }
+        let col = ((sx - src_origin[0]) / src_pixel_size).floor() as i64;
+        let row = ((src_origin[1] - sy) / src_pixel_size).floor() as i64;
+        if col < 0 || row < 0 || col >= sw as i64 || row >= sh as i64 {
+            continue;
+        }
+        out[i] = src[row as usize * sw + col as usize];
+    }
+    Ok(out)
+}
+
 /// Nearest-neighbour u8 → u8 resample (for SCL / classification rasters).
 pub fn resample_u8_to_u8(
     src: &[u8],

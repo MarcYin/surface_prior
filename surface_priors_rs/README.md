@@ -169,6 +169,28 @@ swir22` — mapped to MODIS bands 3/4/1/2/6/7 respectively. MODIS Band 5
 uses `BRDF_Albedo_Band_Mandatory_Quality_Band1`: `0 = full BRDF
 inversion` (best), `1 = magnitude inversion` (acceptable), `255 = fill`.
 
+#### Reprojecting to UTM
+
+To stack MCD43A4 against an S2 or HLS UTM grid, pass
+`output_crs="utm"`. The pipeline keeps the source COG reads in
+sinusoidal coordinates but bilinearly reprojects to UTM during the
+resample step (per-pixel PROJ transform; no extra disk passes).
+
+```python
+out = spx.build_composite(
+    bbox=(30.5, 30.5, 31.6, 31.5),
+    datetime="2024-07-01/2024-07-31",
+    resolution=500.0,
+    endpoint="mcd43a4",
+    output_crs="utm",
+)
+print(out["grid"]["epsg"])     # 32636 (UTM 36N)
+```
+
+Same flag works on `build_monthly_composites`. SCL / Fmask / mandatory-
+quality stay nearest during reprojection, so categorical labels survive
+the CRS change.
+
 ## Use from the command line
 
 The crate also produces a native binary that writes tiled
