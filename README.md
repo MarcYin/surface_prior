@@ -65,10 +65,11 @@ The `surface_priors_rs/` directory in this repo contains a separately
 distributed Rust crate, **`surface-priors-rs`**, that builds best-pixel
 monthly composites end-to-end (STAC search → MGRS tile-aware selection
 → COG fetch → resample → compose) and exposes them to Python as numpy
-arrays — no GeoTIFF writes required. Three sources are supported:
-Sentinel-2 L2A via Planetary Computer (default) or Element84, and
+arrays — no GeoTIFF writes required. Four sources are supported:
+Sentinel-2 L2A via Planetary Computer (default) or Element84;
 Harmonized Landsat-Sentinel-2 (HLS v2.0) L30 + S30 via PC, combined
-into one harmonized 7-band pool.
+into one harmonized 7-band pool; and MODIS MCD43A4 NBAR (daily 500 m,
+output in MODIS Sinusoidal native).
 
 On a 16-core node from JASMIN it produces 5 years × 1 month over a
 100 × 100 km AOI at 60 m in about **6 seconds** parallel or **11
@@ -92,6 +93,14 @@ out = spx.build_composite(
     datetime="2024-07-01/2024-07-31",
     resolution=60.0,
     endpoint="hls",
+)
+
+# MODIS MCD43A4 NBAR (6 bands, native 500 m, output in MODIS Sinusoidal)
+out = spx.build_composite(
+    bbox=(30.5, 30.5, 31.6, 31.5),
+    datetime="2024-07-01/2024-07-31",
+    resolution=500.0,
+    endpoint="mcd43a4",
 )
 
 red = out["bands"]["red"]      # uint16 ndarray (H, W)

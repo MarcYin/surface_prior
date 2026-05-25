@@ -249,6 +249,23 @@ fn mgrs_from_props_or_id(props: &serde_json::Value, id: &str) -> String {
             }
         }
     }
+    // MODIS id format: "MCD43A4.A2024196.h20v05.061.2024205034124".
+    // Use the h/v code as the tile identifier — it slots into the
+    // same `mgrs_tile` field even though it's not actually MGRS.
+    if let Some(rest) = id.strip_prefix("MCD43A") {
+        if rest.starts_with('1') || rest.starts_with('4') || rest.starts_with('A') {
+            let parts: Vec<&str> = id.split('.').collect();
+            if parts.len() >= 3 {
+                let hv = parts[2];
+                if hv.starts_with('h')
+                    && hv.contains('v')
+                    && hv.len() == 6
+                {
+                    return hv.to_string();
+                }
+            }
+        }
+    }
     String::new()
 }
 

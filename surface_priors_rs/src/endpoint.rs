@@ -45,6 +45,13 @@ pub const BAND_NAMES_HLS_HARMONIZED: [&str; 7] = [
     "coastal", "blue", "green", "red", "nir", "swir16", "swir22",
 ];
 
+/// MCD43A4 ships 7 native MODIS reflectance bands; we expose the 6
+/// that overlap the canonical Sentinel-2 / HLS naming (MODIS Band 5
+/// at 1240 nm has no S2/HLS counterpart and is omitted).
+pub const BAND_NAMES_MCD43A4: [&str; 6] = [
+    "blue", "green", "red", "nir", "swir16", "swir22",
+];
+
 /// What kind of cloud / quality raster the endpoint exposes. Drives
 /// scout's "clear" classification and the per-pixel quality score.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,6 +60,9 @@ pub enum QualityKind {
     Scl,
     /// HLS Fmask: bit-packed flags + aerosol level.
     Fmask,
+    /// MODIS MCD43A4 `BRDF_Albedo_Band_Mandatory_Quality_Band{N}`:
+    /// 0 = full BRDF inversion, 1 = magnitude inversion, 255 = nodata.
+    ModisMandatory,
 }
 
 impl QualityKind {
@@ -60,6 +70,7 @@ impl QualityKind {
         match self {
             Self::Scl => v == 0,
             Self::Fmask => v == 255,
+            Self::ModisMandatory => v == 255,
         }
     }
 
@@ -77,6 +88,10 @@ impl QualityKind {
                 let aerosol = (v >> 6) & 0b11;
                 cloudy == 0 && aerosol <= 1
             }
+            // MCD43A4 mandatory quality: 0 = full BRDF inversion. The
+            // BRDF process already filtered clouds upstream, so "0" is
+            // the only thing we count as "clear" here.
+            Self::ModisMandatory => v == 0,
         }
     }
 
@@ -117,6 +132,12 @@ impl QualityKind {
                 }
                 0
             }
+            Self::ModisMandatory => match v {
+                0 => 0,         // full BRDF inversion (best)
+                1 => 1,         // magnitude inversion (acceptable)
+                255 => NODATA,  // fill / no retrieval
+                _ => NODATA,
+            },
         }
     }
 }
@@ -128,6 +149,10 @@ pub enum EndpointKind {
     /// Microsoft PC HLS v2.0: `hls2-l30` + `hls2-s30` combined into one
     /// harmonized composite pool.
     Hls,
+    /// Microsoft PC MODIS MCD43A4 v6.1: daily 500 m Nadir BRDF-Adjusted
+    /// Reflectance. Native CRS is MODIS Sinusoidal, output grid is the
+    /// same CRS (no on-the-fly reprojection).
+    Modis43A4,
 }
 
 impl EndpointKind {
@@ -136,8 +161,11 @@ impl EndpointKind {
             "earth-search" | "es" | "element84" => Ok(Self::EarthSearch),
             "pc" | "planetary-computer" | "planetary_computer" => Ok(Self::PlanetaryComputer),
             "hls" | "hls2" | "hls-l30-s30" => Ok(Self::Hls),
+            "mcd43a4" | "modis-43a4" | "modis-43A4-061" | "modis43a4" => {
+                Ok(Self::Modis43A4)
+            }
             other => anyhow::bail!(
-                "unknown endpoint {other:?}; supported: pc, earth-search, hls"
+                "unknown endpoint {other:?}; supported: pc, earth-search, hls, mcd43a4"
             ),
         }
     }
@@ -168,11 +196,13 @@ pub struct EndpointConfig {
     /// this is all 12 BAND_NAMES; for HLS it's the 7-band harmonized
     /// subset.
     pub band_names_supported: &'static [&'static str],
-    /// Per-collection SAS tokens (PC). Tokens are appended as
-    /// `?{token}` to each asset href; one fetched on demand per
-    /// collection so HLS L30 and S30 can carry their own credentials.
-    /// Anonymous endpoints leave this map empty.
-    sas_tokens_per_collection: parking_lot::RwLock<HashMap<String, String>>,
+    /// SAS tokens cached per Azure (storage_account, container) pair.
+    /// PC's `/api/sas/v1/token/{collection}` endpoint only signs the
+    /// default storage account for each collection; MCD43A4 (and other
+    /// multi-account collections) need the per-href `/api/sas/v1/sign`
+    /// endpoint to land on the right account. We populate this cache
+    /// lazily as new container URLs appear.
+    sas_tokens_per_container: parking_lot::RwLock<HashMap<(String, String), String>>,
 }
 
 impl EndpointConfig {
@@ -181,7 +211,21 @@ impl EndpointConfig {
             EndpointKind::EarthSearch => Self::earth_search(),
             EndpointKind::PlanetaryComputer => Self::planetary_computer(),
             EndpointKind::Hls => Self::hls_pc(),
+            EndpointKind::Modis43A4 => Self::modis_43a4_pc(),
         }
+    }
+
+    /// `eo:cloud_cover` is only meaningful for S2-style scenes; HLS
+    /// has the same property but MCD43A4 (already BRDF-cleaned)
+    /// doesn't, so we skip the STAC `query` filter there.
+    pub fn supports_cloud_cover_filter(&self) -> bool {
+        !matches!(self.kind, EndpointKind::Modis43A4)
+    }
+
+    /// True if the endpoint's COGs are natively in MODIS sinusoidal —
+    /// callers building the output grid use the matching constructor.
+    pub fn uses_modis_sinusoidal(&self) -> bool {
+        matches!(self.kind, EndpointKind::Modis43A4)
     }
 
     pub fn earth_search() -> Self {
@@ -215,7 +259,7 @@ impl EndpointConfig {
             per_collection,
             quality_kind: QualityKind::Scl,
             band_names_supported: &BAND_NAMES,
-            sas_tokens_per_collection: parking_lot::RwLock::new(HashMap::new()),
+            sas_tokens_per_container: parking_lot::RwLock::new(HashMap::new()),
         }
     }
 
@@ -250,7 +294,52 @@ impl EndpointConfig {
             per_collection,
             quality_kind: QualityKind::Scl,
             band_names_supported: &BAND_NAMES,
-            sas_tokens_per_collection: parking_lot::RwLock::new(HashMap::new()),
+            sas_tokens_per_container: parking_lot::RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// PC's MODIS MCD43A4 v6.1 (Nadir BRDF-Adjusted Reflectance, 500 m,
+    /// daily). COGs are in MODIS Sinusoidal — the pipeline emits the
+    /// composite in the same CRS (no on-the-fly reprojection).
+    ///
+    /// Band → asset mapping (MODIS band centres → S2-aligned names):
+    ///   - blue   = Band 3 (459-479 nm)
+    ///   - green  = Band 4 (545-565 nm)
+    ///   - red    = Band 1 (620-670 nm)
+    ///   - nir    = Band 2 (841-876 nm)   -- broad NIR
+    ///   - swir16 = Band 6 (1628-1652 nm)
+    ///   - swir22 = Band 7 (2105-2155 nm)
+    /// MODIS Band 5 (1240 nm) is omitted: no S2 counterpart.
+    ///
+    /// Quality asset: `BRDF_Albedo_Band_Mandatory_Quality_Band1` is
+    /// used as the scene-wide quality proxy — for a per-band quality
+    /// breakdown each band's own _Quality_BandN exists but the
+    /// mandatory flag tracks the BRDF inversion state across bands.
+    pub fn modis_43a4_pc() -> Self {
+        let assets = CollectionAssets {
+            bands: [
+                ("blue", "Nadir_Reflectance_Band3"),
+                ("green", "Nadir_Reflectance_Band4"),
+                ("red", "Nadir_Reflectance_Band1"),
+                ("nir", "Nadir_Reflectance_Band2"),
+                ("swir16", "Nadir_Reflectance_Band6"),
+                ("swir22", "Nadir_Reflectance_Band7"),
+            ]
+            .iter()
+            .map(|(b, a)| (b.to_string(), a.to_string()))
+            .collect(),
+            quality: "BRDF_Albedo_Band_Mandatory_Quality_Band1".into(),
+        };
+        let mut per_collection = HashMap::new();
+        per_collection.insert("modis-43A4-061".to_string(), assets);
+        Self {
+            kind: EndpointKind::Modis43A4,
+            stac_url: "https://planetarycomputer.microsoft.com/api/stac/v1".to_string(),
+            collections: vec!["modis-43A4-061".to_string()],
+            per_collection,
+            quality_kind: QualityKind::ModisMandatory,
+            band_names_supported: &BAND_NAMES_MCD43A4,
+            sas_tokens_per_container: parking_lot::RwLock::new(HashMap::new()),
         }
     }
 
@@ -305,7 +394,7 @@ impl EndpointConfig {
             per_collection,
             quality_kind: QualityKind::Fmask,
             band_names_supported: &BAND_NAMES_HLS_HARMONIZED,
-            sas_tokens_per_collection: parking_lot::RwLock::new(HashMap::new()),
+            sas_tokens_per_container: parking_lot::RwLock::new(HashMap::new()),
         }
     }
 
@@ -341,13 +430,16 @@ impl EndpointConfig {
             .map(|a| a.quality.as_str())
     }
 
-    /// Sign a raw asset href if this endpoint requires SAS-tokening.
-    /// Uses the per-collection token cache for multi-collection
-    /// endpoints (HLS), the single-collection slot otherwise.
+    /// Sign a raw asset href via PC's `/api/sas/v1/sign?href=...`
+    /// endpoint. The returned token is cached per Azure
+    /// (storage_account, container) pair so subsequent hrefs in the
+    /// same container reuse it without another network round-trip.
+    /// The `_collection` argument is kept in the signature for API
+    /// stability but no longer used — signing is purely href-driven.
     pub async fn sign_href(
         &self,
         http: &reqwest::Client,
-        collection: &str,
+        _collection: &str,
         href: &str,
     ) -> Result<String> {
         if !self.requires_sas() {
@@ -356,59 +448,62 @@ impl EndpointConfig {
         if href.contains("?sv=") || href.contains("&sv=") {
             return Ok(href.to_string());
         }
-        let token = self.ensure_sas_token(http, collection).await?;
-        if href.contains('?') {
-            Ok(format!("{href}&{token}"))
-        } else {
-            Ok(format!("{href}?{token}"))
+        let Some((account, container)) = parse_account_container(href) else {
+            return Ok(href.to_string());
+        };
+        // Cached?
+        if let Some(t) = self
+            .sas_tokens_per_container
+            .read()
+            .get(&(account.clone(), container.clone()))
+            .cloned()
+        {
+            return Ok(append_token(href, &t));
         }
+        // Cache miss — round-trip to PC's per-href sign endpoint.
+        let token = self.fetch_sign_token(http, href).await?;
+        self.sas_tokens_per_container
+            .write()
+            .insert((account, container), token.clone());
+        Ok(append_token(href, &token))
     }
 
     fn requires_sas(&self) -> bool {
         matches!(
             self.kind,
-            EndpointKind::PlanetaryComputer | EndpointKind::Hls
+            EndpointKind::PlanetaryComputer | EndpointKind::Hls | EndpointKind::Modis43A4
         )
     }
 
-    async fn ensure_sas_token(
+    /// POST `/api/sas/v1/sign?href=...` and return the bare SAS query
+    /// string (without the leading `?`).
+    async fn fetch_sign_token(
         &self,
         http: &reqwest::Client,
-        collection: &str,
+        href: &str,
     ) -> Result<String> {
-        if let Some(t) = self.sas_tokens_per_collection.read().get(collection).cloned() {
-            return Ok(t);
-        }
         let url = format!(
-            "https://planetarycomputer.microsoft.com/api/sas/v1/token/{collection}"
+            "https://planetarycomputer.microsoft.com/api/sas/v1/sign?href={}",
+            urlencoding::encode(href)
         );
         let resp = http
             .get(&url)
             .send()
             .await
-            .with_context(|| format!("PC SAS token GET {url}"))?
+            .with_context(|| format!("PC SAS sign GET {url}"))?
             .error_for_status()
-            .with_context(|| format!("PC SAS token non-2xx for {url}"))?;
+            .with_context(|| format!("PC SAS sign non-2xx for {url}"))?;
         let body: serde_json::Value = resp.json().await.context("PC SAS body decode")?;
-        let token = body
-            .get("token")
+        let signed_href = body
+            .get("href")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("PC SAS response missing 'token' field"))?
-            .to_string();
-        let expiry = body
-            .get("msft:expiry")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-            .unwrap_or_default();
-        tracing::info!(
-            collection = collection,
-            token_len = token.len(),
-            expiry,
-            "fetched PC SAS token"
-        );
-        self.sas_tokens_per_collection
-            .write()
-            .insert(collection.to_string(), token.clone());
+            .ok_or_else(|| anyhow::anyhow!("PC sign response missing 'href' field"))?;
+        // Extract the query part as the bare token.
+        let token = signed_href
+            .split_once('?')
+            .map(|(_, q)| q.to_string())
+            .ok_or_else(|| anyhow::anyhow!("signed href has no query string"))?;
+        tracing::debug!(token_len = token.len(), "fetched PC SAS token via /sign");
         Ok(token)
     }
 
@@ -471,4 +566,28 @@ pub fn _unused_now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// Parse `(storage_account, container)` from an Azure blob URL like
+/// `https://{account}.blob.core.windows.net/{container}/{blob...}`.
+/// Returns `None` if the href doesn't match this layout.
+fn parse_account_container(href: &str) -> Option<(String, String)> {
+    let without_scheme = href.strip_prefix("https://").or_else(|| href.strip_prefix("http://"))?;
+    let (host, rest) = without_scheme.split_once('/')?;
+    let account = host.split_once('.')?.0.to_string();
+    let container = rest.split('/').next()?.to_string();
+    if account.is_empty() || container.is_empty() {
+        return None;
+    }
+    Some((account, container))
+}
+
+/// Append a SAS token (query string body) to an href, joining with
+/// `?` or `&` as appropriate.
+fn append_token(href: &str, token: &str) -> String {
+    if href.contains('?') {
+        format!("{href}&{token}")
+    } else {
+        format!("{href}?{token}")
+    }
 }

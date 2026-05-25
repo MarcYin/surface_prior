@@ -67,7 +67,7 @@ fn classify_seam_chunks_as_multi_tile() {
         (1usize, "U".to_string(), tile_u),
     ];
     let pixel_area = grid.resolution * grid.resolution;
-    let part = build_partition(&chunks, grid.epsg, &scenes, 1, pixel_area)
+    let part = build_partition(&chunks, &grid.proj_def(), &scenes, 1, pixel_area)
         .unwrap()
         .unwrap();
     // At least one chunk must be classified as multi-tile.
@@ -108,7 +108,7 @@ fn classify_pure_overlap_chunk_picks_one_tile() {
         (1usize, "U".to_string(), tile_u),
     ];
     let pixel_area = grid.resolution * grid.resolution;
-    let part = build_partition(&chunks, grid.epsg, &scenes, 1, pixel_area)
+    let part = build_partition(&chunks, &grid.proj_def(), &scenes, 1, pixel_area)
         .unwrap()
         .unwrap();
     assert_eq!(part.requirements[&0].required_tiles.len(), 1);

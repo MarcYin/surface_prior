@@ -120,13 +120,19 @@ fn run_build(
             .build()?
     };
     rt.block_on(async move {
-        let grid = GridSpec::from_wgs84_bounds(bbox, resolution);
         let endpoint_kind = if endpoint == "auto" {
             auto_pick()
         } else {
             EndpointKind::parse(&endpoint)?
         };
         let endpoint = Arc::new(EndpointConfig::build(endpoint_kind));
+        // MCD43A4 stays in MODIS Sinusoidal end-to-end; everything else
+        // outputs in UTM derived from the AOI centroid.
+        let grid = if endpoint.uses_modis_sinusoidal() {
+            GridSpec::from_wgs84_bounds_modis_sinu(bbox, resolution)
+        } else {
+            GridSpec::from_wgs84_bounds(bbox, resolution)
+        };
 
         let http = Arc::new(
             reqwest::Client::builder()
@@ -147,12 +153,20 @@ fn run_build(
         // 1. list_scenes
         let t = Instant::now();
         let collections_key = endpoint.collections_key();
+        // Cloud-cover filter is only meaningful for S2-style scenes.
+        // MCD43A4 has already filtered clouds in the BRDF inversion,
+        // so its STAC items don't carry `eo:cloud_cover`.
+        let cloud_cover_filter = if endpoint.supports_cloud_cover_filter() {
+            Some(max_cloud_cover)
+        } else {
+            None
+        };
         let stac = StacClient::new(
             &endpoint.stac_url,
             endpoint.collections.clone(),
             bbox,
             datetime.clone(),
-            Some(max_cloud_cover),
+            cloud_cover_filter,
         )?;
         let raw_items = if let Some(c) = &cache {
             let key = c.search_key(
@@ -160,7 +174,7 @@ fn run_build(
                 &collections_key,
                 bbox,
                 &datetime,
-                Some(max_cloud_cover),
+                cloud_cover_filter,
             );
             match c.load_search(&key)? {
                 Some(items) => items,
@@ -231,7 +245,7 @@ fn run_build(
         let quality_kind = endpoint.quality_kind;
         for item in to_scout {
             let http = http.clone();
-            let grid = grid;
+            let grid = grid.clone();
             let sem = request_semaphore.clone();
             // Each scene resolves to its own per-collection quality asset
             // (SCL for S2 L2A scenes, Fmask for HLS L30/S30 scenes).
@@ -298,7 +312,7 @@ fn run_build(
             .collect();
         let partition = build_partition(
             &chunks,
-            grid.epsg,
+            &grid.proj_def(),
             &scene_geoms,
             1,
             (grid.resolution * grid.resolution) as f64,
@@ -358,7 +372,7 @@ fn run_build(
                 let asset = asset.to_string();
                 let scene = scene.clone();
                 let http = http.clone();
-                let grid = grid;
+                let grid = grid.clone();
                 let sem = request_semaphore.clone();
                 band_tasks.push(tokio::spawn(async move {
                     let res = fetch_band(http, &scene, &asset, &grid, sem).await?;
@@ -378,7 +392,7 @@ fn run_build(
             let quality_asset = quality_asset.to_string();
             let scene = scene.clone();
             let http = http.clone();
-            let grid = grid;
+            let grid = grid.clone();
             let sem = request_semaphore.clone();
             band_tasks.push(tokio::spawn(async move {
                 let res = fetch_quality(http, &scene, &grid, sem, &quality_asset).await?;
@@ -433,7 +447,7 @@ fn run_build(
         // 5. compose
         let t = Instant::now();
         let composite =
-            compose_best_pixel(grid, band_names_out.len(), observations, quality_kind);
+            compose_best_pixel(&grid, band_names_out.len(), observations, quality_kind);
         timings.insert("compose".to_string(), t.elapsed().as_secs_f64());
         timings.insert("total".to_string(), t_total.elapsed().as_secs_f64());
 
@@ -502,6 +516,8 @@ fn encode_result(py: Python<'_>, r: BuildResult) -> PyResult<Bound<'_, PyDict>> 
     let grid = PyDict::new_bound(py);
     grid.set_item("bounds", r.grid.bounds.to_vec())?;
     grid.set_item("epsg", r.grid.epsg)?;
+    grid.set_item("proj4", r.grid.proj4.clone())?;
+    grid.set_item("crs", r.grid.proj_def())?;
     grid.set_item("resolution", r.grid.resolution)?;
     grid.set_item("width", r.grid.width)?;
     grid.set_item("height", r.grid.height)?;

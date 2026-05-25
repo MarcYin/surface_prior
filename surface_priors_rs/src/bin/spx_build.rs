@@ -101,10 +101,22 @@ async fn async_main() -> Result<()> {
         anyhow::bail!("--bbox needs exactly 4 numbers");
     }
     let bbox: [f64; 4] = [cli.bbox[0], cli.bbox[1], cli.bbox[2], cli.bbox[3]];
-    let grid = GridSpec::from_wgs84_bounds(bbox, cli.resolution);
+    // Resolve endpoint up front so we can build the right grid (UTM
+    // for S2/HLS, MODIS Sinusoidal for MCD43A4).
+    let endpoint_kind = if cli.endpoint == "auto" {
+        auto_pick()
+    } else {
+        EndpointKind::parse(&cli.endpoint)?
+    };
+    let endpoint_for_grid = EndpointConfig::build(endpoint_kind);
+    let grid = if endpoint_for_grid.uses_modis_sinusoidal() {
+        GridSpec::from_wgs84_bounds_modis_sinu(bbox, cli.resolution)
+    } else {
+        GridSpec::from_wgs84_bounds(bbox, cli.resolution)
+    };
     eprintln!(
-        "grid: epsg={} bounds={:?} size={}x{}",
-        grid.epsg, grid.bounds, grid.width, grid.height
+        "grid: crs={} bounds={:?} size={}x{}",
+        grid.proj_def(), grid.bounds, grid.width, grid.height
     );
 
     // Cap the HTTP semaphore to what the available CPUs can actually
@@ -138,12 +150,9 @@ async fn async_main() -> Result<()> {
             .context("build reqwest client")?,
     );
 
-    // Resolve endpoint: --endpoint=auto picks PC for non-AWS runs.
-    let endpoint_kind = if cli.endpoint == "auto" {
-        auto_pick()
-    } else {
-        EndpointKind::parse(&cli.endpoint)?
-    };
+    // Endpoint already resolved when picking grid CRS above; rebuild
+    // an Arc-wrapped copy for the rest of the pipeline.
+    drop(endpoint_for_grid);
     let endpoint = Arc::new(EndpointConfig::build(endpoint_kind));
     let collections_key = endpoint.collections_key();
     eprintln!(
@@ -167,12 +176,17 @@ async fn async_main() -> Result<()> {
     // Disk cache stores the raw STAC item dicts (unsigned) so that
     // SAS-token signers re-sign on each load.
     let t = Instant::now();
+    let cloud_cover_filter = if endpoint.supports_cloud_cover_filter() {
+        Some(cli.max_cloud_cover)
+    } else {
+        None
+    };
     let stac = StacClient::new(
         &endpoint.stac_url,
         endpoint.collections.clone(),
         bbox,
         cli.datetime.clone(),
-        Some(cli.max_cloud_cover),
+        cloud_cover_filter,
     )?;
     let raw_items = if let Some(c) = &cache {
         let key = c.search_key(
@@ -180,7 +194,7 @@ async fn async_main() -> Result<()> {
             &collections_key,
             bbox,
             &cli.datetime,
-            Some(cli.max_cloud_cover),
+            cloud_cover_filter,
         );
         match c.load_search(&key)? {
             Some(items) => {
@@ -263,7 +277,7 @@ async fn async_main() -> Result<()> {
     let quality_kind = endpoint.quality_kind;
     for item in to_scout {
         let http = http.clone();
-        let grid = grid;
+        let grid = grid.clone();
         let sem = request_semaphore.clone();
         let quality_asset = match endpoint.quality_asset_for(&item.collection) {
             Some(a) => a.to_string(),
@@ -353,7 +367,7 @@ async fn async_main() -> Result<()> {
     } else {
         let built = surface_priors_rs::tile_classification::build_partition(
             &chunks,
-            grid.epsg,
+            &grid.proj_def(),
             &scene_geoms,
             1,
             (grid.resolution * grid.resolution) as f64,
@@ -410,7 +424,7 @@ async fn async_main() -> Result<()> {
             let asset = asset.to_string();
             let scene = scene.clone();
             let http = http.clone();
-            let grid = grid;
+            let grid = grid.clone();
             let sem = request_semaphore.clone();
             band_tasks.push(tokio::spawn(async move {
                 let res = fetch_band(http, &scene, &asset, &grid, sem).await?;
@@ -424,7 +438,7 @@ async fn async_main() -> Result<()> {
         let quality_asset = quality_asset.to_string();
         let scene = scene.clone();
         let http = http.clone();
-        let grid = grid;
+        let grid = grid.clone();
         let sem = request_semaphore.clone();
         band_tasks.push(tokio::spawn(async move {
             let res = fetch_quality(http, &scene, &grid, sem, &quality_asset).await?;
@@ -481,7 +495,7 @@ async fn async_main() -> Result<()> {
     // --- Compose best-pixel ------------------------------------------------
     let t = Instant::now();
     let composite =
-        compose_best_pixel(grid, band_names_out.len(), observations, quality_kind);
+        compose_best_pixel(&grid, band_names_out.len(), observations, quality_kind);
     timing.compose = t.elapsed().as_secs_f64();
     eprintln!("compose:        {:6.2}s", timing.compose);
 

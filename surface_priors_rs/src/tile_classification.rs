@@ -50,7 +50,7 @@ pub struct ChunkWindow {
 
 pub fn build_partition(
     chunks: &[ChunkWindow],
-    grid_epsg: u32,
+    grid_crs: &str,
     scene_geometries_wgs84: &[(usize, String, serde_json::Value)],
     min_exclusive_pixels: u64,
     pixel_area_m2: f64,
@@ -63,7 +63,7 @@ pub fn build_partition(
         scene_to_tile.insert(*scene_idx, tile.clone());
     }
     // 1. Group geometries by MGRS tile, build per-tile union (in grid CRS).
-    let tile_footprints = build_tile_footprints(scene_geometries_wgs84, grid_epsg)?;
+    let tile_footprints = build_tile_footprints(scene_geometries_wgs84, grid_crs)?;
     if tile_footprints.is_empty() {
         return Ok(None);
     }
@@ -86,7 +86,7 @@ pub fn build_partition(
 
 fn build_tile_footprints(
     scene_geometries_wgs84: &[(usize, String, serde_json::Value)],
-    grid_epsg: u32,
+    grid_crs: &str,
 ) -> Result<BTreeMap<String, MultiPolygon<f64>>> {
     let mut grouped: BTreeMap<String, Vec<Polygon<f64>>> = BTreeMap::new();
     for (_scene_idx, tile, geom) in scene_geometries_wgs84 {
@@ -97,7 +97,7 @@ fn build_tile_footprints(
             Some(p) => p,
             None => continue,
         };
-        let projected = reproject_polygon(&poly, "EPSG:4326", &format!("EPSG:{grid_epsg}"))?;
+        let projected = reproject_polygon(&poly, "EPSG:4326", grid_crs)?;
         grouped.entry(tile.clone()).or_default().push(projected);
     }
     let mut out: BTreeMap<String, MultiPolygon<f64>> = BTreeMap::new();

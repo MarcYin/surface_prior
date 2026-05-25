@@ -2,13 +2,14 @@
 
 Production Rust port of the surface-priors monthly composite pipeline,
 with optional Python bindings that return numpy arrays directly (no
-GeoTIFF writes). Supports three STAC sources out of the box:
+GeoTIFF writes). Supports four STAC sources out of the box:
 
-| Endpoint | Collection(s) | Bands | Quality mask |
-|---|---|---|---|
-| `pc` (default) | Sentinel-2 L2A | 12 (full S2 set) | SCL |
-| `earth-search` | Sentinel-2 L2A | 12 (full S2 set) | SCL |
-| `hls` | HLS L30 + S30 (combined harmonized pool) | 7 common bands | Fmask |
+| Endpoint | Collection(s) | Bands | Quality mask | Output CRS |
+|---|---|---|---|---|
+| `pc` (default) | Sentinel-2 L2A | 12 (full S2 set) | SCL | UTM (from AOI) |
+| `earth-search` | Sentinel-2 L2A | 12 (full S2 set) | SCL | UTM (from AOI) |
+| `hls` | HLS L30 + S30 (combined harmonized pool) | 7 common bands | Fmask | UTM (from AOI) |
+| `mcd43a4` | MCD43A4 v6.1 (MODIS NBAR, daily) | 6 (no rededge) | Mandatory_Quality_Band1 | MODIS Sinusoidal (native) |
 
 ## What it does
 
@@ -112,6 +113,35 @@ reads `B04` (they happen to align), while "nir" reads `B05` on L30 and
 `B8A` on S30. Quality scoring uses the bit-packed Fmask: cloud,
 cirrus, cloud shadow, snow, and high aerosol bits each weight into a
 lower-is-better score that drives best-pixel selection.
+
+### MODIS MCD43A4 (NBAR)
+
+`endpoint="mcd43a4"` pulls the daily 500 m MODIS Nadir BRDF-Adjusted
+Reflectance product from PC's `modis-43A4-061` collection.
+
+Output stays in **MODIS Sinusoidal** end-to-end — no on-the-fly
+reprojection to UTM. The returned `grid` dict reports `epsg=0` and
+carries the proj4 string instead:
+
+```python
+out = spx.build_composite(
+    bbox=(30.5, 30.5, 31.6, 31.5),
+    datetime="2024-07-01/2024-07-31",
+    resolution=500.0,           # MODIS native
+    endpoint="mcd43a4",
+)
+print(out["grid"]["proj4"])
+# '+proj=sinu +lon_0=0 +x_0=0 +y_0=0 +a=6371007.181 +b=6371007.181 ...'
+```
+
+If you need MCD43A4 stacked against an S2 or HLS UTM grid, `gdalwarp`
+/ `rio warp` the returned arrays as a post-processing step.
+
+Six harmonized bands are exposed: `blue, green, red, nir, swir16,
+swir22` — mapped to MODIS bands 3/4/1/2/6/7 respectively. MODIS Band 5
+(1240 nm) has no S2 / HLS counterpart and is omitted. Quality scoring
+uses `BRDF_Albedo_Band_Mandatory_Quality_Band1`: `0 = full BRDF
+inversion` (best), `1 = magnitude inversion` (acceptable), `255 = fill`.
 
 ## Use from the command line
 

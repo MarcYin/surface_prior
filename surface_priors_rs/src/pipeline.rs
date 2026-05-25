@@ -481,7 +481,7 @@ pub struct Composite {
 /// mapping is precomputed in parallel using `kind` so the same
 /// composer handles both SCL and Fmask scenes.
 pub fn compose_best_pixel(
-    grid: GridSpec,
+    grid: &GridSpec,
     n_bands: usize,
     observations: Vec<(String, Vec<Vec<u16>>, Vec<u8>)>,
     kind: QualityKind,
@@ -517,7 +517,7 @@ pub fn compose_best_pixel(
         }
     }
     Composite {
-        grid,
+        grid: grid.clone(),
         bands: best_data,
         quality: best_quality,
         observation_count,

@@ -15,11 +15,24 @@ use std::arch::x86_64::*;
 use crate::cog::{OverviewLevel, PixelWindow};
 use crate::projx;
 
-#[derive(Debug, Clone, Copy)]
+/// MODIS sinusoidal projection as used by MCD43A4 / MCD43A1 etc.
+/// Spherical Earth model, radius 6371007.181 m. Not a standard EPSG
+/// code — pass the proj4 string directly to PROJ.
+pub const MODIS_SINU_PROJ4: &str =
+    "+proj=sinu +lon_0=0 +x_0=0 +y_0=0 +a=6371007.181 +b=6371007.181 +units=m +no_defs";
+
+#[derive(Debug, Clone)]
 pub struct GridSpec {
-    /// UTM bounds (xmin, ymin, xmax, ymax) snapped to `resolution`.
+    /// Grid bounds (xmin, ymin, xmax, ymax) snapped to `resolution`,
+    /// expressed in the grid's own CRS (UTM metres for S2/HLS,
+    /// sinusoidal metres for MODIS).
     pub bounds: [f64; 4],
+    /// EPSG code for the grid CRS. `0` when the CRS is non-EPSG —
+    /// in that case `proj4` carries the definition.
     pub epsg: u32,
+    /// Custom proj4 string used when `epsg == 0` (MODIS sinusoidal).
+    /// `None` for normal EPSG-coded grids.
+    pub proj4: Option<String>,
     pub resolution: f64,
     pub width: u32,
     pub height: u32,
@@ -39,6 +52,26 @@ impl GridSpec {
         GridSpec {
             bounds: snapped,
             epsg,
+            proj4: None,
+            resolution,
+            width,
+            height,
+        }
+    }
+
+    /// Build a MODIS-sinusoidal grid from WGS84 bounds, snapped to
+    /// `resolution`. Used by MCD43A4 / MCD43A1 endpoints whose COGs
+    /// are natively in MODIS sinusoidal.
+    pub fn from_wgs84_bounds_modis_sinu(bbox: [f64; 4], resolution: f64) -> Self {
+        let sinu = projx::transform_bounds("EPSG:4326", MODIS_SINU_PROJ4, bbox, 21)
+            .expect("PROJ WGS84→MODIS Sinusoidal");
+        let snapped = projx::snap_bounds(sinu, resolution);
+        let width = ((snapped[2] - snapped[0]) / resolution).round() as u32;
+        let height = ((snapped[3] - snapped[1]) / resolution).round() as u32;
+        GridSpec {
+            bounds: snapped,
+            epsg: 0,
+            proj4: Some(MODIS_SINU_PROJ4.to_string()),
             resolution,
             width,
             height,
@@ -48,6 +81,16 @@ impl GridSpec {
     pub fn affine_transform(&self) -> [f64; 6] {
         // (a, b, xoff, d, e, yoff) — north-up.
         [self.resolution, 0.0, self.bounds[0], 0.0, -self.resolution, self.bounds[3]]
+    }
+
+    /// PROJ-readable string for this grid's CRS — either `"EPSG:N"`
+    /// or the custom proj4 string (MODIS sinusoidal).
+    pub fn proj_def(&self) -> String {
+        if let Some(p) = &self.proj4 {
+            p.clone()
+        } else {
+            format!("EPSG:{}", self.epsg)
+        }
     }
 }
 

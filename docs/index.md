@@ -48,10 +48,15 @@ Sources that can resolve their native grid, such as the `edown` Google Earth Eng
 
 The repository also ships a separate Rust crate, **`surface-priors-rs`**,
 that produces best-pixel monthly composites and returns them to Python
-as numpy arrays. Supports Sentinel-2 L2A (Planetary Computer / Element84,
-12 bands) and HLS v2.0 L30 + S30 (Planetary Computer, combined harmonized
-7-band pool). On a 16-core node it builds 5 years × 1 month over a
-100 × 100 km AOI at 60 m in roughly 6-7 seconds, network-bound against
+as numpy arrays. Supports four STAC sources:
+
+- Sentinel-2 L2A (PC or Element84) — 12 bands, UTM output.
+- HLS v2.0 L30 + S30 (PC) — 7 common bands, harmonized pool, UTM.
+- MCD43A4 v6.1 (PC) — daily MODIS NBAR, 6 bands at 500 m, output in
+  MODIS Sinusoidal native CRS.
+
+On a 16-core node it builds 5 years × 1 month over a 100 × 100 km
+S2/HLS AOI at 60 m in roughly 6-7 seconds, network-bound against
 Planetary Computer.
 
 ```python
