@@ -702,15 +702,6 @@ fn run_build_periods(
         .iter()
         .flat_map(|y| months_sorted.iter().map(move |m| (*y, *m)))
         .collect();
-    let min_year = *years_sorted.first().unwrap();
-    let max_year = *years_sorted.last().unwrap();
-    let min_month = *months_sorted.first().unwrap();
-    let max_month = *months_sorted.last().unwrap();
-    // STAC handles "yyyy-mm-31" gracefully even for Feb — extra day yields
-    // zero items. Avoids dealing with leap years and DST nonsense.
-    let full_datetime = format!(
-        "{min_year:04}-{min_month:02}-01/{max_year:04}-{max_month:02}-31"
-    );
 
     let rt = shared_runtime();
     rt.block_on(async move {
@@ -737,34 +728,75 @@ fn run_build_periods(
             None
         };
 
-        // 1. ONE STAC search across the union datetime range.
+        // 1. One STAC search per requested (year, month), run concurrently.
+        //
+        // A single search over the contiguous min..max range pages through
+        // every gap month between the requested ones — July-only across 5
+        // years scans ~48 months of scenes (hundreds of items, many pages),
+        // which measured ~11s and dominated the wall. Searching each period
+        // separately pages only the months we actually compose; running the
+        // searches concurrently keeps total latency to roughly one search.
+        // The disk cache keys each search on its own per-period datetime, so
+        // warm runs reuse them. (For contiguous month ranges this is a few
+        // more searches than one union query, but each is small and they
+        // overlap, so the wall is unchanged — and gap months are never
+        // scanned.)
         let t = Instant::now();
-        let stac = StacClient::new(
-            &endpoint.stac_url,
-            endpoint.collections.clone(),
-            bbox,
-            full_datetime.clone(),
-            cloud_cover_filter,
-        )?;
-        let raw_items = if let Some(c) = &cache {
-            let key = c.search_key(
-                &endpoint.stac_url,
-                &collections_key,
-                bbox,
-                &full_datetime,
-                cloud_cover_filter,
-            );
-            match c.load_search(&key)? {
-                Some(items) => items,
-                None => {
+        // STAC tolerates "yyyy-mm-31" for short months (extra days yield no
+        // items), so we avoid leap-year/last-day arithmetic.
+        let period_datetimes: Vec<String> = periods
+            .iter()
+            .map(|(y, m)| format!("{y:04}-{m:02}-01/{y:04}-{m:02}-31"))
+            .collect();
+        let search_futs = period_datetimes.iter().map(|dt| {
+            let endpoint = &endpoint;
+            let cache = &cache;
+            let collections_key = &collections_key;
+            async move {
+                let stac = StacClient::new(
+                    &endpoint.stac_url,
+                    endpoint.collections.clone(),
+                    bbox,
+                    dt.clone(),
+                    cloud_cover_filter,
+                )?;
+                if let Some(c) = cache {
+                    let key = c.search_key(
+                        &endpoint.stac_url,
+                        collections_key,
+                        bbox,
+                        dt,
+                        cloud_cover_filter,
+                    );
+                    if let Some(items) = c.load_search(&key)? {
+                        return Ok::<Vec<serde_json::Value>, anyhow::Error>(items);
+                    }
                     let fresh = stac.search_raw().await.context("STAC search")?;
                     c.store_search(&key, &fresh)?;
-                    fresh
+                    Ok(fresh)
+                } else {
+                    Ok(stac.search_raw().await.context("STAC search")?)
                 }
             }
-        } else {
-            stac.search_raw().await.context("STAC search")?
-        };
+        });
+        let per_period_raw = futures::future::try_join_all(search_futs).await?;
+        // Flatten; dedup by item id (a scene belongs to exactly one month,
+        // so collisions are unlikely, but be defensive).
+        let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut raw_items: Vec<serde_json::Value> = Vec::new();
+        for batch in per_period_raw {
+            for it in batch {
+                match it.get("id").and_then(|v| v.as_str()) {
+                    Some(id) => {
+                        if seen_ids.insert(id.to_string()) {
+                            raw_items.push(it);
+                        }
+                    }
+                    None => raw_items.push(it),
+                }
+            }
+        }
+
         let signed_items: Vec<serde_json::Value> = {
             let mut signed = Vec::with_capacity(raw_items.len());
             for raw in raw_items {
@@ -897,53 +929,44 @@ fn run_build_periods(
                 .collect()
         };
 
-        // 3. Compose per (year, month). Each period's fetch is
-        // independent; spawn them concurrently and let the shared
-        // connection pool / semaphore arbitrate. Periods that share
-        // tiles benefit from the OS page cache + reqwest connection
-        // reuse without any explicit sharing in our code.
-        let endpoint_arc = endpoint.clone();
-        let http_arc = http.clone();
-        let sem_arc = request_semaphore.clone();
+        // 3. Compose per (year, month) SEQUENTIALLY.
+        //
+        // compose_one_period already fans every (scene × band) fetch out
+        // across the shared semaphore and connection pool, which saturates
+        // the link on its own. Running multiple periods concurrently only
+        // oversubscribes it: in-flight requests climb past the idle-pool
+        // size (forcing fresh TCP+TLS handshakes) and contend for bandwidth,
+        // dropping aggregate throughput *below* the sequential case
+        // (measured ~23.7s concurrent vs ~15.9s sequential for a 5-period
+        // Nile Delta batch against PC, and per-period fetch inflated ~2.5s
+        // → ~7.5s). The batch win is the shared (concurrent) searches +
+        // single scout pass above — not period-level fetch parallelism. Each
+        // period also reuses the now-warm connection pool left by the
+        // previous one.
         let band_names_arc = Arc::new(band_names_out);
         let items_arc = Arc::new(items);
         let stats_arc = Arc::new(stats_map);
 
-        let mut period_tasks = Vec::with_capacity(periods.len());
-        for (year, month) in periods {
-            let endpoint = endpoint_arc.clone();
-            let http = http_arc.clone();
-            let sem = sem_arc.clone();
-            let band_names = band_names_arc.clone();
-            let items = items_arc.clone();
-            let stats = stats_arc.clone();
-            let grid = grid.clone();
-            period_tasks.push(tokio::spawn(async move {
-                compose_one_period(
-                    year,
-                    month,
-                    items.as_ref(),
-                    stats.as_ref(),
-                    &grid,
-                    endpoint.as_ref(),
-                    http,
-                    sem,
-                    band_names.as_ref(),
-                    top_k,
-                    source_proj_for_fetch,
-                )
-                .await
-                .map(|build| PeriodResult { year, month, build })
-            }));
-        }
-
-        let mut results: Vec<PeriodResult> = Vec::with_capacity(period_tasks.len());
+        let mut results: Vec<PeriodResult> = Vec::with_capacity(periods.len());
         let mut errs: Vec<String> = Vec::new();
-        for task in period_tasks {
-            match task.await {
-                Ok(Ok(r)) => results.push(r),
-                Ok(Err(e)) => errs.push(format!("period err: {e:#}")),
-                Err(e) => errs.push(format!("period panic: {e}")),
+        for (year, month) in periods {
+            match compose_one_period(
+                year,
+                month,
+                items_arc.as_ref(),
+                stats_arc.as_ref(),
+                &grid,
+                endpoint.as_ref(),
+                http.clone(),
+                request_semaphore.clone(),
+                band_names_arc.as_ref(),
+                top_k,
+                source_proj_for_fetch,
+            )
+            .await
+            {
+                Ok(build) => results.push(PeriodResult { year, month, build }),
+                Err(e) => errs.push(format!("period {year:04}-{month:02} err: {e:#}")),
             }
         }
         if results.is_empty() && !errs.is_empty() {
@@ -951,6 +974,17 @@ fn run_build_periods(
         }
         // Sort by (year, month) for stable output ordering.
         results.sort_by_key(|r| (r.year, r.month));
+
+        // Surface the shared (amortized-once) phase costs on every period,
+        // mirroring what build_composite returns per call. These are not
+        // per-period — they're the single search + single scout shared
+        // across the whole batch.
+        for r in results.iter_mut() {
+            r.build
+                .timings
+                .insert("shared_list_scenes".to_string(), dt_list);
+            r.build.timings.insert("shared_scout".to_string(), dt_scout);
+        }
 
         tracing::info!(
             list_scenes = dt_list,
