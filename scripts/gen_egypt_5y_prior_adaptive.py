@@ -15,15 +15,15 @@ import time
 from pathlib import Path
 
 import numpy as np
+import rasterio
 
 # Import surface_priors_rs first: its package init pins PROJ_DATA so rasterio's
 # GDAL/PROJ no longer clobbers the native WGS84->UTM transform — import order
 # is no longer load-bearing, so rasterio/PIL can be imported normally up top.
 import surface_priors_rs as spx
-import rasterio
 from affine import Affine
-from rasterio.crs import CRS
 from PIL import Image
+from rasterio.crs import CRS
 
 BBOX = (30.5, 30.5, 31.6, 31.5)  # Nile Delta, WGS84
 YEARS = [2020, 2021, 2022, 2023, 2024]
@@ -35,7 +35,7 @@ DISK_CACHE = "/tmp/spx-egypt-5y-adaptive"
 OUT_DIR = Path("egypt_5y_prior_adaptive")
 # fix-branch selection: adaptive depth + windowed fetch (full-observer
 # preference is on by default).
-SEL = dict(coverage_target=0.95, min_k=2, max_k=6, windowed_fetch=True)
+SEL = {"coverage_target": 0.95, "min_k": 2, "max_k": 6, "windowed_fetch": True}
 
 
 # Natural-colour: DN -> reflectance, one fixed gain across all channels

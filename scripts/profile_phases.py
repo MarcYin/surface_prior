@@ -11,7 +11,6 @@ from __future__ import annotations
 import argparse
 import sys
 import time
-from pathlib import Path
 from typing import Iterable, Optional
 
 import numpy as np
@@ -112,7 +111,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     print(f"  select:          {select_t:6.2f}s")
     print(f"  fetch:           {fetch_t:6.2f}s")
     print(f"  compose:         {compose_t:6.2f}s")
-    print(f"  ─────────────────")
+    print("  ─────────────────")
     print(f"  TOTAL:           {total:6.2f}s")
     return 0
 

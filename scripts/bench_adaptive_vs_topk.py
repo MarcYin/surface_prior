@@ -20,7 +20,6 @@ import sys
 import time
 
 import numpy as np
-
 import surface_priors_rs as spx
 
 BBOX = (30.5, 30.5, 31.6, 31.5)  # Nile Delta, WGS84
@@ -101,9 +100,9 @@ def main(argv=None) -> int:
         # runs compare fetch/compose work, not a one-off cold scout.
         _build(year, args.month, args.cache, top_k=6)
 
-        adaptive_sel = dict(
-            coverage_target=args.coverage_target, min_k=args.min_k, max_k=args.max_k,
-        )
+        adaptive_sel = {
+            "coverage_target": args.coverage_target, "min_k": args.min_k, "max_k": args.max_k,
+        }
         recs = [
             _run_config(year, args.month, args.cache, "top_k=3", top_k=3),
             _run_config(year, args.month, args.cache, "top_k=6", top_k=6),

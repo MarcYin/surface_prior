@@ -76,7 +76,8 @@ def build_tile_footprints(
 
     try:
         from shapely.geometry import shape
-        from shapely.ops import transform as shapely_transform, unary_union
+        from shapely.ops import transform as shapely_transform
+        from shapely.ops import unary_union
     except ImportError as exc:
         raise ImportError(
             "tile classification requires shapely (transitively installed with rasterio)"

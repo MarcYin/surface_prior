@@ -11,7 +11,6 @@ we can assert cache hits/misses without network. The cache must:
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Mapping
 
 import pytest
 
@@ -199,9 +198,7 @@ def test_scenes_signature_is_order_invariant():
         {"id": "A", "geometry": {"type": "Point", "coordinates": [0, 0]}, "properties": {"s2:mgrs_tile": "T"}},
         {"id": "B", "geometry": {"type": "Point", "coordinates": [1, 1]}, "properties": {"s2:mgrs_tile": "U"}},
     ]
-    b = list(reversed(a))
-    # Different order → different signature is acceptable, but identical
-    # order must produce identical signature.
+    # Identical order must produce an identical signature.
     assert scenes_signature(a) == scenes_signature(list(a))
 
 

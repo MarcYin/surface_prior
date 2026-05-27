@@ -23,12 +23,6 @@ import numpy as np
 
 from surface_priors.chunks import ChunkLayout, chunk_grid
 from surface_priors.selection import SceneChunkStats, SelectionPlan
-from surface_priors.sources.stac_cache import StacDiskCache, scenes_signature
-from surface_priors.tile_classification import (
-    ChunkTileRequirement,
-    TilePartition,
-    build_partition,
-)
 from surface_priors.sources.s2 import (
     DEFAULT_CHUNK_SIZE,
     DEFAULT_SCOUT_FACTOR,
@@ -39,7 +33,13 @@ from surface_priors.sources.s2 import (
     scl_to_quality,
     scl_valid_mask,
 )
+from surface_priors.sources.stac_cache import StacDiskCache, scenes_signature
 from surface_priors.temporal import sample_temporal_ranges, temporal_ranges_name
+from surface_priors.tile_classification import (
+    ChunkTileRequirement,
+    TilePartition,
+    build_partition,
+)
 from surface_priors.types import GridSpec, Observation
 
 EARTH_SEARCH_URL = "https://earth-search.aws.element84.com/v1"
@@ -781,19 +781,19 @@ class StacApiSource:
         scenes = self.list_scenes(grid=grid)
         scene = _find_scene(scenes, scene_index)
         if scene is None:
-            return {cid: None for cid in chunk_ids_int}
+            return dict.fromkeys(chunk_ids_int)
 
         sr_assets: list[str] = []
         for band in band_names:
             sr_asset = self.aliases.band_to_asset.get(band)
             if sr_asset is None or sr_asset not in scene.asset_hrefs:
-                return {cid: None for cid in chunk_ids_int}
+                return dict.fromkeys(chunk_ids_int)
             sr_assets.append(sr_asset)
 
         quality_asset = self.aliases.quality_asset()
         quality_href = scene.asset_hrefs.get(quality_asset)
         if quality_href is None:
-            return {cid: None for cid in chunk_ids_int}
+            return dict.fromkeys(chunk_ids_int)
 
         chunk_grids: Mapping[int, GridSpec] = {
             cid: chunk_grid(grid, plan.layout[cid]) for cid in chunk_ids_int
@@ -959,7 +959,7 @@ class StacApiSource:
                 raise ImportError("StacApiSource requires rasterio.") from exc
             opener = rasterio.open
         env = self._env_context()
-        out: dict[int, Optional[np.ndarray]] = {key: None for key in grids}
+        out: dict[int, Optional[np.ndarray]] = dict.fromkeys(grids)
         if not grids:
             return out
         union = _union_grid(grids)

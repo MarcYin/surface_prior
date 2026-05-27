@@ -11,12 +11,12 @@ import pytest
 
 shapely = pytest.importorskip("shapely")
 
-from surface_priors.chunks import ChunkLayout
-from surface_priors.tile_classification import (
+from surface_priors.chunks import ChunkLayout  # noqa: E402
+from surface_priors.tile_classification import (  # noqa: E402
     build_partition,
     classify_chunks,
 )
-from surface_priors.types import GridSpec
+from surface_priors.types import GridSpec  # noqa: E402
 
 
 def _grid_with_wgs84(bounds, crs, resolution, wgs84):

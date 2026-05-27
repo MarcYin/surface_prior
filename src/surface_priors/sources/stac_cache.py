@@ -15,6 +15,7 @@ self-healing.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -182,10 +183,8 @@ def _atomic_write(path: Path, data: Any) -> None:
             json.dump(payload, fh)
         os.replace(tmp_path, path)
     except OSError:
-        try:
+        with contextlib.suppress(OSError):
             tmp_path.unlink()
-        except OSError:
-            pass
 
 
 def scenes_signature(items: Sequence[Mapping[str, Any]]) -> str:

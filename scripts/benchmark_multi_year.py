@@ -112,7 +112,6 @@ def main(argv: Iterable[str] | None = None) -> int:
         layout = ChunkLayout.from_grid(grid, chunk_size=args.chunk_size)
         # Sequential per-month builds against the SAME source instance.
         per_month = {}
-        list_t = part_t = 0.0
         for build_month in months_to_build:
             month_str = _month_str(year, build_month)
             month_start = f"{month_str}-01"
@@ -149,10 +148,9 @@ def main(argv: Iterable[str] | None = None) -> int:
     print(f"target month = {target}, building target±1 ({months_to_build}) for years {args.years}")
     print(f"cache dir = {args.cache_dir}")
 
-    if args.passes >= 1:
+    if args.passes >= 1 and args.cache_dir.exists():
         # Start cold.
-        if args.cache_dir.exists():
-            shutil.rmtree(args.cache_dir)
+        shutil.rmtree(args.cache_dir)
 
     from concurrent.futures import ThreadPoolExecutor, as_completed
 

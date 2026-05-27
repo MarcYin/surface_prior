@@ -10,12 +10,12 @@ import time
 from pathlib import Path
 
 import numpy as np
+import rasterio
 
 # Import surface_priors_rs first: its package init pins PROJ_DATA so rasterio's
 # GDAL/PROJ no longer clobbers the native WGS84->UTM transform — import order
 # is no longer load-bearing, so rasterio can be imported normally up top.
 import surface_priors_rs as spx
-import rasterio
 from affine import Affine
 from rasterio.crs import CRS
 

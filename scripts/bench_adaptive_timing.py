@@ -18,15 +18,14 @@ import time
 from pathlib import Path
 
 import numpy as np
-
 import surface_priors_rs as spx
 
 BBOX = (30.5, 30.5, 31.6, 31.5)
 BANDS = ["coastal", "blue", "green", "red", "nir", "swir16", "swir22"]
 
 CONFIGS = {
-    "top_k=6": dict(top_k=6),
-    "adaptive+L2": dict(coverage_target=0.95, min_k=2, max_k=6, windowed_fetch=True),
+    "top_k=6": {"top_k": 6},
+    "adaptive+L2": {"coverage_target": 0.95, "min_k": 2, "max_k": 6, "windowed_fetch": True},
 }
 
 
@@ -67,8 +66,7 @@ def main(argv=None) -> int:
         print(f"config {name}  ({sel})")
         cold_wall, results = _run(args.years, args.month, cache, sel)
         cold = _summary(results)
-        warm_wall, results = _run(args.years, args.month, cache, sel)
-        warm = _summary(results)
+        warm_wall, _ = _run(args.years, args.month, cache, sel)
         print(
             f"  cold wall={cold_wall:6.2f}s  warm wall={warm_wall:6.2f}s  "
             f"scenes={cold['scenes']:3d}  read={cold['read']:7.1f}Mpx  "

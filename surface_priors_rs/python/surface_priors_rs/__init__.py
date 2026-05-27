@@ -45,8 +45,8 @@ def _ensure_proj_data() -> None:
 
 _ensure_proj_data()
 
-from .surface_priors_rs import *  # noqa: E402,F401,F403
 from . import surface_priors_rs as _core  # noqa: E402
+from .surface_priors_rs import *  # noqa: E402,F401,F403
 
 __doc__ = _core.__doc__
 if hasattr(_core, "__all__"):

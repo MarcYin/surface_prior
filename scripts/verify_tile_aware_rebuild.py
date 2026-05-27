@@ -133,10 +133,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     for record in rebuilt:
         before = record["stripe_fill_before"]
         after = record["stripe_fill_after"]
-        if before is None:
-            before_pct = "-"
-        else:
-            before_pct = f"{before * 100:5.1f}%"
+        before_pct = "-" if before is None else f"{before * 100:5.1f}%"
         after_pct = f"{after * 100:5.1f}%"
         partition = record["tile_partition"] or {}
         print(

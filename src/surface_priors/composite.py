@@ -13,7 +13,6 @@ from surface_priors.selection import SelectionPlan
 from surface_priors.tile_classification import summarise as summarise_partition
 from surface_priors.types import GridSpec, Observation, PriorComposite
 
-
 SceneFetcher = Callable[[int], Mapping[int, Optional[Observation]]]
 
 

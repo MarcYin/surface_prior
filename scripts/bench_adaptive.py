@@ -10,8 +10,12 @@ network-bound cost), and per-period coverage.
 """
 from __future__ import annotations
 
-import argparse, json, shutil, subprocess, sys, time
-from pathlib import Path
+import argparse
+import json
+import shutil
+import subprocess
+import sys
+import time
 
 BBOX = (30.5, 30.5, 31.6, 31.5)
 YEARS = [2020, 2021, 2022, 2023, 2024]
@@ -19,15 +23,16 @@ BANDS = ["coastal", "blue", "green", "red", "nir", "swir16", "swir22"]
 
 # name -> kwargs for build_monthly_composites
 CONFIGS = {
-    "top_k=3": dict(top_k=3),
-    "top_k=6": dict(top_k=6),
-    "adaptive": dict(coverage_target=0.98, min_k=2, max_k=8),
-    "adaptive+windowed": dict(coverage_target=0.98, min_k=2, max_k=8, windowed_fetch=True),
+    "top_k=3": {"top_k": 3},
+    "top_k=6": {"top_k": 6},
+    "adaptive": {"coverage_target": 0.98, "min_k": 2, "max_k": 8},
+    "adaptive+windowed": {"coverage_target": 0.98, "min_k": 2, "max_k": 8, "windowed_fetch": True},
 }
 
 
 def run_one(name: str) -> dict:
-    import numpy as np, surface_priors_rs as spx
+    import numpy as np
+    import surface_priors_rs as spx
     cache = f"/tmp/bench-adapt-{name.replace('=', '').replace('+', '-')}"
     shutil.rmtree(cache, ignore_errors=True)
     t0 = time.time()
