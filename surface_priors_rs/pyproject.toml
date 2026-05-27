@@ -19,6 +19,12 @@ classifiers = [
 # spx-build artefact.
 features = ["python"]
 bindings = "pyo3"
+# Mixed layout: hand-written Python package in python/ ships alongside the
+# compiled extension. It re-exports the Rust module unchanged and adds a
+# type stub (__init__.pyi) documenting build_composite /
+# build_monthly_composites — including the adaptive-depth + windowed-fetch
+# params — so they're discoverable and typed from Python.
+python-source = "python"
 # We don't want the spx-build binary inside the wheel; it ships as
 # a separate native binary.
 exclude = [

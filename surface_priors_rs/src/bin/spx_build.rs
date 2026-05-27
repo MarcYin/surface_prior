@@ -246,25 +246,9 @@ async fn async_main() -> Result<()> {
                 cli.scout_factor,
             );
             if let Some(cached) = c.load_scout(&key)? {
-                // The cached per-chunk stats are still useful for
-                // chunk-aware selection, but for the current
-                // selector we collapse to a per-scene summary.
-                let usable = cached
-                    .iter()
-                    .map(|s| s.usable_fraction)
-                    .fold(0.0_f32, |a, b| a.max(b));
-                let mean_clear = cached
-                    .iter()
-                    .map(|s| s.mean_clear)
-                    .filter(|v| v.is_finite())
-                    .fold(f32::NAN, |a, b| if a.is_finite() { a.max(b) } else { b });
                 stats_map.insert(
                     item.id.clone(),
-                    surface_priors_rs::pipeline::SceneStats {
-                        item_id: item.id.clone(),
-                        usable_fraction: usable,
-                        mean_clear,
-                    },
+                    surface_priors_rs::pipeline::scenestats_from_cache(&item.id, &cached),
                 );
                 continue;
             }
@@ -319,14 +303,7 @@ async fn async_main() -> Result<()> {
                         512,
                         cli.scout_factor,
                     );
-                    // Store a single-chunk summary for now (selection
-                    // doesn't yet consume per-chunk stats from cache).
-                    let stat = surface_priors_rs::pipeline::SceneChunkStat {
-                        chunk_id: 0,
-                        usable_fraction: s.usable_fraction,
-                        mean_clear: s.mean_clear,
-                    };
-                    let _ = c.store_scout(&key, &[stat]);
+                    let _ = c.store_scout(&key, &surface_priors_rs::pipeline::scenestats_to_cache(&s));
                 }
                 stats_map.insert(s.item_id.clone(), s);
             }

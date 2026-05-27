@@ -14,6 +14,7 @@ CDSE bearer token) and plugs in through `AssetUrlSigner`.
 from __future__ import annotations
 
 import math
+import re
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping, Optional, Protocol, Sequence, Tuple
@@ -22,6 +23,12 @@ import numpy as np
 
 from surface_priors.chunks import ChunkLayout, chunk_grid
 from surface_priors.selection import SceneChunkStats, SelectionPlan
+from surface_priors.sources.stac_cache import StacDiskCache, scenes_signature
+from surface_priors.tile_classification import (
+    ChunkTileRequirement,
+    TilePartition,
+    build_partition,
+)
 from surface_priors.sources.s2 import (
     DEFAULT_CHUNK_SIZE,
     DEFAULT_SCOUT_FACTOR,
@@ -186,6 +193,31 @@ CDSE_S2_ALIASES = StacAssetAliases(
 )
 
 
+_MGRS_FROM_ITEM_ID = re.compile(r"S2[AB]_([0-9]{2}[A-Z]{3})_")
+
+
+def _mgrs_tile_from_item(item_id: str, properties: Mapping[str, Any]) -> str:
+    """Best-effort MGRS code extraction from item metadata.
+
+    Earth-Search exposes ``grid:code`` (e.g., "MGRS-36RTU"); Planetary
+    Computer and CDSE expose ``s2:mgrs_tile``. The Sentinel-2 item id
+    encodes the tile as ``S2[AB]_<TILE>_…`` and is the most reliable
+    fallback because it works across all three endpoints.
+    """
+
+    for key in ("s2:mgrs_tile", "mgrs:tile"):
+        value = properties.get(key)
+        if value:
+            return str(value)
+    grid_code = properties.get("grid:code")
+    if isinstance(grid_code, str) and grid_code.upper().startswith("MGRS-"):
+        return grid_code.split("-", 1)[1]
+    match = _MGRS_FROM_ITEM_ID.match(str(item_id))
+    if match:
+        return match.group(1)
+    return ""
+
+
 @dataclass(frozen=True)
 class StacScene:
     """A STAC item resolved to per-band hrefs and a stable scene_index."""
@@ -195,6 +227,8 @@ class StacScene:
     datetime: str
     asset_hrefs: Mapping[str, str]
     properties: Mapping[str, Any] = field(default_factory=dict)
+    mgrs_tile: str = ""
+    geometry: Optional[Mapping[str, Any]] = None
 
 
 class StacApiSource:
@@ -212,8 +246,10 @@ class StacApiSource:
         scout_factor: int = DEFAULT_SCOUT_FACTOR,
         chunk_size: int = DEFAULT_CHUNK_SIZE,
         max_scenes: Optional[int] = None,
-        scout_workers: int = 16,
-        band_workers: int = 12,
+        scout_workers: int = 32,
+        band_workers: int = 3,
+        max_cloud_cover: Optional[float] = 90.0,
+        disk_cache: Any = None,
         name: Optional[str] = None,
         stac_client: Any = None,
         opener: Any = None,
@@ -240,6 +276,10 @@ class StacApiSource:
         self.max_scenes = None if max_scenes is None else int(max_scenes)
         self.scout_workers = max(1, int(scout_workers))
         self.band_workers = max(1, int(band_workers))
+        self.max_cloud_cover = (
+            None if max_cloud_cover is None else float(max_cloud_cover)
+        )
+        self.disk_cache = StacDiskCache.from_arg(disk_cache)
         self._stac_client = stac_client
         self._opener = opener  # injected rasterio.open replacement for tests
         self.gdal_env: Mapping[str, str] = dict(gdal_env) if gdal_env is not None else dict(
@@ -255,6 +295,9 @@ class StacApiSource:
         )
         self._scenes: Optional[Tuple[StacScene, ...]] = None
         self._scenes_key: Optional[tuple] = None
+        self._raw_items: Tuple[Mapping[str, Any], ...] = ()
+        self._partition_cache: dict[tuple, Optional[TilePartition]] = {}
+        self._scout_cache: dict[tuple, dict[int, Tuple[SceneChunkStats, ...]]] = {}
 
     @property
     def name(self) -> str:
@@ -341,6 +384,70 @@ class StacApiSource:
         del grid, band_names
         return None
 
+    def tile_partition(
+        self,
+        *,
+        grid: GridSpec,
+        layout: ChunkLayout,
+    ) -> Optional[TilePartition]:
+        scenes = self.list_scenes(grid=grid)
+        if not scenes:
+            return None
+        mem_key = (
+            tuple(float(value) for value in grid.bounds),
+            str(grid.crs),
+            float(grid.resolution),
+            int(grid.width),
+            int(grid.height),
+            int(layout.applied_chunk_size),
+            tuple(window.chunk_id for window in layout),
+        )
+        cached = self._partition_cache.get(mem_key)
+        if cached is not None or mem_key in self._partition_cache:
+            return cached
+
+        scene_tiles: dict[int, str] = {}
+        scene_geometries: dict[int, Mapping[str, Any]] = {}
+        for scene in scenes:
+            if not scene.mgrs_tile or scene.geometry is None:
+                continue
+            scene_tiles[int(scene.scene_index)] = scene.mgrs_tile
+            scene_geometries[int(scene.scene_index)] = scene.geometry
+        if not scene_tiles:
+            self._partition_cache[mem_key] = None
+            return None
+
+        disk_key: Optional[str] = None
+        if self.disk_cache is not None:
+            disk_key = self.disk_cache.partition_key(
+                scenes_signature=scenes_signature(self._raw_items),
+                grid_signature=(
+                    tuple(float(v) for v in grid.bounds),
+                    str(grid.crs),
+                    float(grid.resolution),
+                    int(grid.width),
+                    int(grid.height),
+                ),
+                layout_signature=(int(layout.applied_chunk_size),),
+            )
+            payload = self.disk_cache.load_partition(disk_key)
+            if payload is not None:
+                partition = _partition_from_payload(payload)
+                if partition is not None:
+                    self._partition_cache[mem_key] = partition
+                    return partition
+
+        partition = build_partition(
+            layout=layout,
+            grid=grid,
+            scene_tiles=scene_tiles,
+            scene_geometries_wgs84=scene_geometries,
+        )
+        self._partition_cache[mem_key] = partition
+        if partition is not None and self.disk_cache is not None and disk_key is not None:
+            self.disk_cache.store_partition(disk_key, _partition_to_payload(partition))
+        return partition
+
     def list_scenes(self, *, grid: GridSpec) -> Tuple[StacScene, ...]:
         if grid.wgs84_bounds is None:
             raise ValueError("StacApiSource requires GridSpec with WGS84 bounds")
@@ -351,46 +458,111 @@ class StacApiSource:
         )
         if self._scenes is not None and self._scenes_key == key:
             return self._scenes
-        client = self._client()
-        items: list[StacScene] = []
-        for start, end in self.query_temporal_ranges:
-            search = client.search(
-                collections=[self.collection],
-                bbox=list(grid.wgs84_bounds),
-                datetime=f"{start}/{end}",
-            )
-            for raw_item in _iter_items(search):
-                signed = self.signer.sign_item(_item_to_dict(raw_item))
-                asset_hrefs = {
-                    asset_key: asset["href"]
-                    for asset_key, asset in signed.get("assets", {}).items()
-                    if isinstance(asset, Mapping) and asset.get("href")
-                }
-                items.append(
-                    StacScene(
-                        scene_index=len(items),
-                        item_id=str(signed.get("id", "")),
-                        datetime=str(signed.get("properties", {}).get("datetime", "")),
-                        asset_hrefs=asset_hrefs,
-                        properties=dict(signed.get("properties", {})),
-                    )
-                )
-        items.sort(key=lambda scene: scene.datetime)
-        if self.max_scenes is not None:
-            items = items[: self.max_scenes]
-        scenes = tuple(
-            StacScene(
-                scene_index=index,
-                item_id=scene.item_id,
-                datetime=scene.datetime,
-                asset_hrefs=scene.asset_hrefs,
-                properties=scene.properties,
-            )
-            for index, scene in enumerate(items)
-        )
+        raw_items = self._load_raw_items(grid=grid)
+        scenes = self._build_scenes(raw_items)
         self._scenes = scenes
         self._scenes_key = key
+        self._raw_items = raw_items
+        self._partition_cache.clear()
+        self._scout_cache.clear()
         return scenes
+
+    def _load_raw_items(self, *, grid: GridSpec) -> Tuple[Mapping[str, Any], ...]:
+        """Return unsigned STAC item dicts, hitting the disk cache when possible.
+
+        Signing (Planetary Computer SAS tokens, CDSE bearer headers) is
+        applied later in ``_build_scenes`` so cached items don't carry
+        expired URLs.
+        """
+
+        raw_items: list[Mapping[str, Any]] = []
+        cache = self.disk_cache
+        for start, end in self.query_temporal_ranges:
+            cache_key: Optional[str] = None
+            if cache is not None:
+                cache_key = cache.search_key(
+                    stac_url=self.stac_url,
+                    collection=self.collection,
+                    wgs84_bounds=grid.wgs84_bounds,
+                    datetime_range=(start, end),
+                    max_cloud_cover=self.max_cloud_cover,
+                )
+                cached = cache.load_search(cache_key)
+                if cached is not None:
+                    raw_items.extend(cached)
+                    continue
+            range_items = self._search_range(grid=grid, start=start, end=end)
+            raw_items.extend(range_items)
+            if cache is not None and cache_key is not None:
+                cache.store_search(cache_key, range_items)
+        return tuple(raw_items)
+
+    def _search_range(
+        self,
+        *,
+        grid: GridSpec,
+        start: str,
+        end: str,
+    ) -> list[Mapping[str, Any]]:
+        client = self._client()
+        search_kwargs: dict[str, Any] = {
+            "collections": [self.collection],
+            "bbox": list(grid.wgs84_bounds),
+            "datetime": f"{start}/{end}",
+        }
+        if self.max_cloud_cover is not None and self.max_cloud_cover < 100.0:
+            # Server-side cloud filter: drop scenes that are nothing-but-cloud
+            # before they hit the wire. Trims list_scenes payload AND halves
+            # scout reads. Threshold is intentionally high (default 90%)
+            # because the producer's cloud_cover is a tile-level scalar and
+            # an AOI may be clearer than its enclosing MGRS tile.
+            search_kwargs["query"] = {
+                "eo:cloud_cover": {"lt": float(self.max_cloud_cover)}
+            }
+        search = client.search(**search_kwargs)
+        return [_item_to_dict(raw_item) for raw_item in _iter_items(search)]
+
+    def _build_scenes(
+        self,
+        raw_items: Sequence[Mapping[str, Any]],
+    ) -> Tuple[StacScene, ...]:
+        signed_items: list[Mapping[str, Any]] = []
+        for raw in raw_items:
+            signed = self.signer.sign_item(raw)
+            signed_items.append(signed)
+        # Stable ordering on datetime then id so cache hits and live
+        # searches yield identical scene_indices.
+        signed_items.sort(
+            key=lambda item: (
+                str(item.get("properties", {}).get("datetime", "")),
+                str(item.get("id", "")),
+            )
+        )
+        if self.max_scenes is not None:
+            signed_items = signed_items[: self.max_scenes]
+        scenes: list[StacScene] = []
+        for index, signed in enumerate(signed_items):
+            asset_hrefs = {
+                asset_key: asset["href"]
+                for asset_key, asset in signed.get("assets", {}).items()
+                if isinstance(asset, Mapping) and asset.get("href")
+            }
+            properties = dict(signed.get("properties", {}))
+            item_id = str(signed.get("id", ""))
+            raw_geom = signed.get("geometry")
+            geometry = dict(raw_geom) if isinstance(raw_geom, Mapping) else None
+            scenes.append(
+                StacScene(
+                    scene_index=index,
+                    item_id=item_id,
+                    datetime=str(properties.get("datetime", "")),
+                    asset_hrefs=asset_hrefs,
+                    properties=properties,
+                    mgrs_tile=_mgrs_tile_from_item(item_id, properties),
+                    geometry=geometry,
+                )
+            )
+        return tuple(scenes)
 
     def scout(
         self,
@@ -410,6 +582,30 @@ class StacApiSource:
             max(1, int(math.ceil(grid.height / self.scout_factor))),
             max(1, int(math.ceil(grid.width / self.scout_factor))),
         )
+
+        # Per-scene scout output is a pure function of (grid, layout,
+        # scout_factor). When the same source is reused for multiple
+        # builds (e.g. monthly slices of one quarter), each scene's
+        # stats are computed at most once.
+        mem_cache_key = (
+            tuple(float(value) for value in grid.bounds),
+            str(grid.crs),
+            float(grid.resolution),
+            int(grid.width),
+            int(grid.height),
+            int(layout.applied_chunk_size),
+            int(self.scout_factor),
+        )
+        cache = self._scout_cache.setdefault(mem_cache_key, {})
+
+        grid_signature = (
+            tuple(float(v) for v in grid.bounds),
+            str(grid.crs),
+            float(grid.resolution),
+            int(grid.width),
+            int(grid.height),
+        )
+        layout_signature = (int(layout.applied_chunk_size),)
 
         def scout_scene(scene: StacScene) -> Tuple[SceneChunkStats, ...]:
             score, valid = self._scout_quality(scene=scene, grid=grid, coarse_shape=coarse_shape)
@@ -431,14 +627,54 @@ class StacApiSource:
                 scout_factor=self.scout_factor,
             )
 
+        def disk_key_for(scene: StacScene) -> Optional[str]:
+            if self.disk_cache is None or not scene.item_id:
+                return None
+            return self.disk_cache.scout_key(
+                stac_url=self.stac_url,
+                collection=self.collection,
+                item_id=scene.item_id,
+                grid_signature=grid_signature,
+                layout_signature=layout_signature,
+                scout_factor=self.scout_factor,
+            )
+
+        to_scout: list[StacScene] = []
+        for scene in scenes:
+            if scene.scene_index in cache:
+                continue
+            disk_key = disk_key_for(scene)
+            if disk_key is not None:
+                disk_entry = self.disk_cache.load_scout(disk_key)
+                if disk_entry is not None:
+                    cache[scene.scene_index] = _scout_entry_from_payload(
+                        disk_entry, scene_index=scene.scene_index
+                    )
+                    continue
+            to_scout.append(scene)
+
+        if to_scout:
+            disk = self.disk_cache
+            if self.scout_workers <= 1:
+                for scene in to_scout:
+                    entries = scout_scene(scene)
+                    cache[scene.scene_index] = entries
+                    if disk is not None:
+                        disk_key = disk_key_for(scene)
+                        if disk_key is not None:
+                            disk.store_scout(disk_key, _scout_entry_to_payload(entries))
+            else:
+                with ThreadPoolExecutor(max_workers=self.scout_workers) as pool:
+                    for scene, entries in zip(to_scout, pool.map(scout_scene, to_scout)):
+                        cache[scene.scene_index] = entries
+                        if disk is not None:
+                            disk_key = disk_key_for(scene)
+                            if disk_key is not None:
+                                disk.store_scout(disk_key, _scout_entry_to_payload(entries))
+
         results: list[SceneChunkStats] = []
-        if self.scout_workers <= 1:
-            for scene in scenes:
-                results.extend(scout_scene(scene))
-        else:
-            with ThreadPoolExecutor(max_workers=self.scout_workers) as pool:
-                for entries in pool.map(scout_scene, scenes):
-                    results.extend(entries)
+        for scene in scenes:
+            results.extend(cache[scene.scene_index])
         return tuple(results)
 
     def fetch_selected(
@@ -520,6 +756,120 @@ class StacApiSource:
             },
         )
 
+    def fetch_selected_for_scene(
+        self,
+        *,
+        grid: GridSpec,
+        plan: SelectionPlan,
+        band_names: Sequence[str],
+        scene_index: int,
+        chunk_ids: Sequence[int],
+    ) -> Mapping[int, Optional[Observation]]:
+        """Open each band COG once and read all selected chunks for one scene.
+
+        Tile-aware selection fans out multi-tile chunks across multiple
+        scenes; the same scene often contributes to several chunks. Doing
+        a per-(scene, chunk) ``fetch_selected`` opens each COG once per
+        chunk. This method opens each band COG once per scene instead
+        and reads every chunk window from the open dataset, eliminating
+        redundant header GETs.
+        """
+
+        if not chunk_ids:
+            return {}
+        chunk_ids_int = [int(c) for c in chunk_ids]
+        scenes = self.list_scenes(grid=grid)
+        scene = _find_scene(scenes, scene_index)
+        if scene is None:
+            return {cid: None for cid in chunk_ids_int}
+
+        sr_assets: list[str] = []
+        for band in band_names:
+            sr_asset = self.aliases.band_to_asset.get(band)
+            if sr_asset is None or sr_asset not in scene.asset_hrefs:
+                return {cid: None for cid in chunk_ids_int}
+            sr_assets.append(sr_asset)
+
+        quality_asset = self.aliases.quality_asset()
+        quality_href = scene.asset_hrefs.get(quality_asset)
+        if quality_href is None:
+            return {cid: None for cid in chunk_ids_int}
+
+        chunk_grids: Mapping[int, GridSpec] = {
+            cid: chunk_grid(grid, plan.layout[cid]) for cid in chunk_ids_int
+        }
+
+        def read_asset_for_all_chunks(
+            href: str,
+            resample: str,
+        ) -> Mapping[int, Optional[np.ndarray]]:
+            return self._read_windows(href=href, grids=chunk_grids, resample=resample)
+
+        sr_results: dict[str, Mapping[int, Optional[np.ndarray]]] = {}
+        quality_results: Mapping[int, Optional[np.ndarray]] = {}
+        if self.band_workers <= 1:
+            for asset in sr_assets:
+                sr_results[asset] = read_asset_for_all_chunks(scene.asset_hrefs[asset], "bilinear")
+            quality_results = read_asset_for_all_chunks(quality_href, "nearest")
+        else:
+            with ThreadPoolExecutor(max_workers=self.band_workers) as pool:
+                future_map: dict = {}
+                for asset in sr_assets:
+                    future = pool.submit(
+                        read_asset_for_all_chunks,
+                        scene.asset_hrefs[asset],
+                        "bilinear",
+                    )
+                    future_map[future] = ("sr", asset)
+                quality_future = pool.submit(
+                    read_asset_for_all_chunks, quality_href, "nearest"
+                )
+                future_map[quality_future] = ("quality", None)
+                for future, kind_asset in future_map.items():
+                    kind, asset = kind_asset
+                    result = future.result()
+                    if kind == "sr":
+                        sr_results[asset] = result
+                    else:
+                        quality_results = result
+
+        out: dict[int, Optional[Observation]] = {}
+        sr_scale = float(self.aliases.sr_scale)
+        uses_cs_plus = self.aliases.uses_cloud_score_plus()
+        for cid in chunk_ids_int:
+            window = plan.layout[cid]
+            band_arrays: list[np.ndarray] = []
+            ok = True
+            for asset in sr_assets:
+                arr = sr_results.get(asset, {}).get(cid)
+                if arr is None:
+                    ok = False
+                    break
+                arr = arr.astype("float32", copy=False) * sr_scale
+                band_arrays.append(apply_zero_as_nodata(arr))
+            quality = quality_results.get(cid)
+            if not ok or quality is None:
+                out[cid] = None
+                continue
+            if uses_cs_plus:
+                quality_array = cloud_score_to_quality(quality.astype("float32", copy=False))
+            else:
+                quality_array = scl_to_quality(quality.astype("int16", copy=False))
+            data = np.stack(band_arrays, axis=0).astype("float32", copy=False)
+            out[cid] = Observation(
+                data=data,
+                quality=quality_array,
+                band_names=tuple(str(band) for band in band_names),
+                source_id=scene.item_id,
+                metadata={
+                    "stac_collection": self.collection,
+                    "stac_url": self.stac_url,
+                    "datetime": scene.datetime,
+                    "chunk_id": int(window.chunk_id),
+                },
+            )
+        return out
+
     def _scout_quality(
         self,
         *,
@@ -582,6 +932,61 @@ class StacApiSource:
         except (OSError, RuntimeError):
             return None
 
+    def _read_windows(
+        self,
+        *,
+        href: str,
+        grids: Mapping[int, GridSpec],
+        resample: str,
+    ) -> Mapping[int, Optional[np.ndarray]]:
+        """Open ``href`` once and return all requested chunk arrays.
+
+        Reads a single window covering the union of every chunk's bounds,
+        then slices the result per chunk. One HTTP range fetch covers all
+        chunks for a (scene, band) instead of one per chunk — this is the
+        big win for multi-chunk scenes under tile-aware selection.
+
+        Falls back to per-chunk reads when the chunks share no common CRS
+        or when the union read fails. Returned dict mirrors ``grids``
+        keys; entries are ``None`` when the underlying read fails.
+        """
+
+        opener = self._opener
+        if opener is None:
+            try:
+                import rasterio  # type: ignore
+            except ImportError as exc:
+                raise ImportError("StacApiSource requires rasterio.") from exc
+            opener = rasterio.open
+        env = self._env_context()
+        out: dict[int, Optional[np.ndarray]] = {key: None for key in grids}
+        if not grids:
+            return out
+        union = _union_grid(grids)
+        try:
+            with env, opener(href) as dataset:
+                big = None
+                if union is not None:
+                    try:
+                        big = _read_to_grid(dataset, grid=union, resample=resample)
+                    except (OSError, RuntimeError):
+                        big = None
+                if big is not None:
+                    for key, sub_grid in grids.items():
+                        out[key] = _slice_from_union(big, union=union, sub_grid=sub_grid)
+                else:
+                    # Heterogeneous CRS or union failed — fall back per chunk.
+                    for key, sub_grid in grids.items():
+                        try:
+                            out[key] = _read_to_grid(
+                                dataset, grid=sub_grid, resample=resample
+                            )
+                        except (OSError, RuntimeError):
+                            out[key] = None
+        except (OSError, RuntimeError):
+            return out
+        return out
+
     def _env_context(self):
         if self._opener is not None or not self.gdal_env:
             from contextlib import nullcontext
@@ -605,6 +1010,62 @@ class StacApiSource:
                 "StacApiSource requires pystac-client: pip install pystac-client"
             ) from exc
         return Client.open(self.stac_url)
+
+
+def _union_grid(grids: Mapping[int, GridSpec]) -> Optional[GridSpec]:
+    """Smallest pixel-aligned bbox that contains every chunk grid.
+
+    All chunks must share the same CRS and resolution (true for chunked
+    layouts of a single grid). Returns ``None`` when that invariant is
+    violated so callers can fall back to per-chunk reads.
+    """
+
+    items = list(grids.values())
+    if not items:
+        return None
+    first = items[0]
+    crs = first.crs
+    res = float(first.resolution)
+    for grid in items[1:]:
+        if grid.crs != crs or float(grid.resolution) != res:
+            return None
+    xmin = min(grid.bounds[0] for grid in items)
+    ymin = min(grid.bounds[1] for grid in items)
+    xmax = max(grid.bounds[2] for grid in items)
+    ymax = max(grid.bounds[3] for grid in items)
+    width = int(round((xmax - xmin) / res))
+    height = int(round((ymax - ymin) / res))
+    if width <= 0 or height <= 0:
+        return None
+    return GridSpec(
+        bounds=(xmin, ymin, xmax, ymax),
+        crs=crs,
+        resolution=res,
+        width=width,
+        height=height,
+        wgs84_bounds=None,
+    )
+
+
+def _slice_from_union(
+    big: np.ndarray,
+    *,
+    union: GridSpec,
+    sub_grid: GridSpec,
+) -> np.ndarray:
+    """Carve a chunk's array out of the union read.
+
+    Coordinate math is integer-pixel because both grids share resolution
+    and CRS. ``big`` is shaped ``(union.height, union.width)``.
+    """
+
+    res = float(union.resolution)
+    col_off = int(round((sub_grid.bounds[0] - union.bounds[0]) / res))
+    row_off = int(round((union.bounds[3] - sub_grid.bounds[3]) / res))
+    return big[
+        row_off : row_off + int(sub_grid.height),
+        col_off : col_off + int(sub_grid.width),
+    ]
 
 
 def _read_to_grid(dataset: Any, *, grid: GridSpec, resample: str) -> Optional[np.ndarray]:
@@ -738,6 +1199,76 @@ def _transform_wgs84_to_crs(
         raise ImportError("StacApiSource requires pyproj for grid alignment.") from exc
     transformer = Transformer.from_crs("EPSG:4326", dst_crs, always_xy=True)
     return transformer.transform_bounds(*[float(v) for v in wgs84_bounds], densify_pts=21)
+
+
+def _scout_entry_to_payload(
+    entries: Sequence[SceneChunkStats],
+) -> list[Mapping[str, Any]]:
+    """Serialise per-chunk stats for one scene; scene_index is dropped because
+    the cache is keyed on item_id and rebuilt with the current source's
+    scene_index on load."""
+
+    return [
+        {
+            "chunk_id": int(entry.chunk_id),
+            "usable_fraction": float(entry.usable_fraction),
+            "mean_clear": float(entry.mean_clear),
+        }
+        for entry in entries
+    ]
+
+
+def _scout_entry_from_payload(
+    payload: Sequence[Mapping[str, Any]],
+    *,
+    scene_index: int,
+) -> Tuple[SceneChunkStats, ...]:
+    return tuple(
+        SceneChunkStats(
+            scene_index=int(scene_index),
+            chunk_id=int(item["chunk_id"]),
+            usable_fraction=float(item["usable_fraction"]),
+            mean_clear=float(item["mean_clear"]),
+        )
+        for item in payload
+    )
+
+
+def _partition_to_payload(partition: TilePartition) -> dict[str, Any]:
+    return {
+        "tiles": list(partition.tiles),
+        "scene_to_tile": {str(k): v for k, v in partition.scene_to_tile.items()},
+        "requirements": {
+            str(chunk_id): {
+                "chunk_id": int(req.chunk_id),
+                "required_tiles": list(req.required_tiles),
+                "unreachable_pixel_fraction": float(req.unreachable_pixel_fraction),
+            }
+            for chunk_id, req in partition.requirements.items()
+        },
+    }
+
+
+def _partition_from_payload(payload: Mapping[str, Any]) -> Optional[TilePartition]:
+    try:
+        tiles = tuple(str(t) for t in payload.get("tiles", ()))
+        scene_to_tile = {
+            int(k): str(v) for k, v in payload.get("scene_to_tile", {}).items()
+        }
+        requirements = {}
+        for chunk_id, req_dict in payload.get("requirements", {}).items():
+            requirements[int(chunk_id)] = ChunkTileRequirement(
+                chunk_id=int(req_dict["chunk_id"]),
+                required_tiles=tuple(str(t) for t in req_dict["required_tiles"]),
+                unreachable_pixel_fraction=float(req_dict["unreachable_pixel_fraction"]),
+            )
+    except (KeyError, TypeError, ValueError):
+        return None
+    return TilePartition(
+        requirements=requirements,
+        scene_to_tile=scene_to_tile,
+        tiles=tiles,
+    )
 
 
 def _snap_bounds_to_resolution(

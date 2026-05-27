@@ -75,7 +75,7 @@ def test_provider_runs_chunked_pipeline_end_to_end(tmp_path):
             cache_dir=tmp_path / "cache",
             source=source,
             chunk_size=2,
-            selection_policy=SelectionPolicy(top_k=2, min_usable_fraction=0.5),
+            selection_policy=SelectionPolicy(top_k=2),
             fetch_workers=1,
         )
     )
@@ -118,7 +118,7 @@ def test_chunked_request_hash_changes_with_policy(tmp_path):
             cache_dir=tmp_path / "a",
             source=source,
             chunk_size=2,
-            selection_policy=SelectionPolicy(top_k=1, min_usable_fraction=0.5),
+            selection_policy=SelectionPolicy(top_k=1),
         )
     )
     provider_b = Provider(
@@ -126,7 +126,7 @@ def test_chunked_request_hash_changes_with_policy(tmp_path):
             cache_dir=tmp_path / "b",
             source=source,
             chunk_size=2,
-            selection_policy=SelectionPolicy(top_k=3, min_usable_fraction=0.5),
+            selection_policy=SelectionPolicy(top_k=3),
         )
     )
 
@@ -140,16 +140,17 @@ def test_chunked_request_hash_changes_with_policy(tmp_path):
     assert provider_a.request_hash(**args) != provider_b.request_hash(**args)
 
 
-def test_chunked_pipeline_skips_chunks_below_usable_floor(tmp_path):
+def test_chunked_pipeline_skips_chunks_with_no_usable_contribution(tmp_path):
     bands = ("iso",)
     obs_grid = {
         "data": np.full((1, 4, 4), 0.30, dtype="float32"),
         "quality": np.zeros((4, 4), dtype="uint16"),
     }
-    # Only chunk 0 passes the usable fraction floor; chunks 1..3 are too cloudy/sparse.
+    # Only chunk 0 has any usable contribution; chunks 1..3 are off-swath
+    # (zero usable_fraction) and selection drops them.
     stats = [
         SceneChunkStats(scene_index=0, chunk_id=0, usable_fraction=0.9, mean_clear=0.9),
-        SceneChunkStats(scene_index=0, chunk_id=1, usable_fraction=0.1, mean_clear=0.9),
+        SceneChunkStats(scene_index=0, chunk_id=1, usable_fraction=0.0, mean_clear=float("nan")),
         SceneChunkStats(scene_index=0, chunk_id=2, usable_fraction=0.0, mean_clear=float("nan")),
         SceneChunkStats(scene_index=0, chunk_id=3, usable_fraction=0.0, mean_clear=float("nan")),
     ]
@@ -160,7 +161,7 @@ def test_chunked_pipeline_skips_chunks_below_usable_floor(tmp_path):
             cache_dir=tmp_path / "cache",
             source=source,
             chunk_size=2,
-            selection_policy=SelectionPolicy(top_k=1, min_usable_fraction=0.5),
+            selection_policy=SelectionPolicy(top_k=1),
         )
     )
 
@@ -199,7 +200,7 @@ def test_layout_uses_block_size_when_source_advertises_one(tmp_path):
             cache_dir=tmp_path / "cache",
             source=source,
             chunk_size=2,
-            selection_policy=SelectionPolicy(top_k=1, min_usable_fraction=0.5),
+            selection_policy=SelectionPolicy(top_k=1),
         )
     )
     product = provider.build_prior(
@@ -265,7 +266,7 @@ def test_temporal_filter_amortizes_scene_listing_across_months(tmp_path):
             cache_dir=tmp_path / "cache",
             source=source,
             chunk_size=2,
-            selection_policy=SelectionPolicy(top_k=2, min_usable_fraction=0.5),
+            selection_policy=SelectionPolicy(top_k=2),
             fetch_workers=1,
         )
     )

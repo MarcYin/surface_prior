@@ -56,7 +56,7 @@ def main() -> int:
             cache_dir=args.cache_dir,
             source=source,
             chunk_size=args.chunk_size,
-            selection_policy=SelectionPolicy(top_k=args.top_k, min_usable_fraction=0.5),
+            selection_policy=SelectionPolicy(top_k=args.top_k),
             fetch_workers=args.fetch_workers,
         )
     )

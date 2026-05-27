@@ -26,6 +26,12 @@ pub struct SceneChunkStat {
     pub chunk_id: u32,
     pub usable_fraction: f32,
     pub mean_clear: f32,
+    /// Coarse clear-cell bitmap for this chunk (empty if not observed).
+    #[serde(default)]
+    pub clear_mask: Vec<u8>,
+    /// Coarse observed-cell bitmap for this chunk (empty if not observed).
+    #[serde(default)]
+    pub valid_mask: Vec<u8>,
 }
 
 /// All the bands the surface_priors Python pipeline reads for S2 L2A
@@ -50,7 +56,65 @@ pub struct SceneStats {
     pub item_id: String,
     pub usable_fraction: f32,
     pub mean_clear: f32,
+    /// Per-chunk clear fraction (clear pixels / total pixels in chunk),
+    /// indexed by `chunk_id` (row-major 512-px blocks, matching
+    /// `chunks_from_grid`). Empty when the scene misses the AOI. Used for
+    /// `usable_fraction` and the legacy top-k selectors.
+    pub chunk_clear: Vec<f32>,
+    /// Per-chunk coarse clear/observed mask, indexed by `chunk_id` like
+    /// `chunk_clear`. Drives mask-based adaptive depth: selection stacks
+    /// scenes until the union of clear cells covers the chunk.
+    pub chunk_masks: Vec<ChunkMask>,
 }
+
+/// Reconstruct per-scene stats (incl. per-chunk clear fractions) from the
+/// disk cache's per-chunk records. Inverse of [`scenestats_to_cache`].
+pub fn scenestats_from_cache(item_id: &str, cached: &[SceneChunkStat]) -> SceneStats {
+    let n = cached.iter().map(|s| s.chunk_id as usize + 1).max().unwrap_or(0);
+    let mut chunk_clear = vec![0.0f32; n];
+    let mut chunk_masks = vec![ChunkMask::default(); n];
+    let mut mean_clear = f32::NAN;
+    for s in cached {
+        let c = s.chunk_id as usize;
+        chunk_clear[c] = s.usable_fraction;
+        chunk_masks[c] = ChunkMask { clear: s.clear_mask.clone(), valid: s.valid_mask.clone() };
+        if s.mean_clear.is_finite() && !mean_clear.is_finite() {
+            mean_clear = s.mean_clear;
+        }
+    }
+    let usable = chunk_clear.iter().copied().fold(0.0f32, f32::max);
+    SceneStats {
+        item_id: item_id.to_string(),
+        usable_fraction: usable,
+        mean_clear,
+        chunk_clear,
+        chunk_masks,
+    }
+}
+
+/// Per-chunk records to persist for one scene's scout result. Inverse of
+/// [`scenestats_from_cache`].
+pub fn scenestats_to_cache(s: &SceneStats) -> Vec<SceneChunkStat> {
+    s.chunk_clear
+        .iter()
+        .enumerate()
+        .map(|(c, &f)| {
+            let m = s.chunk_masks.get(c).cloned().unwrap_or_default();
+            SceneChunkStat {
+                chunk_id: c as u32,
+                usable_fraction: f,
+                mean_clear: s.mean_clear,
+                clear_mask: m.clear,
+                valid_mask: m.valid,
+            }
+        })
+        .collect()
+}
+
+/// Chunk edge length in pixels. Must match the value passed to
+/// `chunks_from_grid` / `build_partition` in the build pipeline so that
+/// scout's per-chunk binning lines up with the partition's chunk ids.
+pub const SELECT_CHUNK_SIZE: u32 = 512;
 
 /// Scout a single scene: open its quality COG, read at coarse
 /// resolution, compute per-AOI usable_fraction + mean_clear. The
@@ -108,6 +172,8 @@ pub async fn scout_scene(
                 item_id: scene.id.clone(),
                 usable_fraction: 0.0,
                 mean_clear: f32::NAN,
+                chunk_clear: Vec::new(),
+                chunk_masks: Vec::new(),
             });
         }
     };
@@ -159,11 +225,139 @@ pub async fn scout_scene(
         )?
     };
     let (usable, mean_clear) = quality_to_stats(&quality_buf, quality_kind);
+    let chunk_clear = per_chunk_clear(&quality_buf, dst_w, dst_h, SELECT_CHUNK_SIZE, quality_kind);
+    let chunk_masks = per_chunk_masks(&quality_buf, dst_w, dst_h, SELECT_CHUNK_SIZE, quality_kind);
     Ok(SceneStats {
         item_id: scene.id.clone(),
         usable_fraction: usable,
         mean_clear,
+        chunk_clear,
+        chunk_masks,
     })
+}
+
+/// Clear fraction (clear pixels / total pixels) per chunk, binning the
+/// full-grid quality buffer into row-major `chunk`-px blocks so the
+/// index lines up with `chunks_from_grid` chunk ids.
+pub fn per_chunk_clear(buf: &[u8], width: u32, height: u32, chunk: u32, kind: QualityKind) -> Vec<f32> {
+    let (w, h, cs) = (width as usize, height as usize, chunk as usize);
+    let n_cols = w.div_ceil(cs);
+    let n_rows = h.div_ceil(cs);
+    let mut out = vec![0.0f32; n_cols * n_rows];
+    for cr in 0..n_rows {
+        let r0 = cr * cs;
+        let r1 = (r0 + cs).min(h);
+        for cc in 0..n_cols {
+            let c0 = cc * cs;
+            let c1 = (c0 + cs).min(w);
+            let (mut total, mut clear) = (0u32, 0u32);
+            for r in r0..r1 {
+                let row = &buf[r * w + c0..r * w + c1];
+                for &v in row {
+                    total += 1;
+                    if !kind.is_nodata(v) && kind.is_clear(v) {
+                        clear += 1;
+                    }
+                }
+            }
+            out[cr * n_cols + cc] = if total > 0 { clear as f32 / total as f32 } else { 0.0 };
+        }
+    }
+    out
+}
+
+/// Side length, in cells, of the coarse per-chunk clear mask. A 512-px
+/// chunk bins to a `CHUNK_MASK_DIM × CHUNK_MASK_DIM` grid; selection
+/// stacks scenes until the *union* of their clear cells covers the
+/// chunk's reachable area, so depth adapts to the actual cloud pattern
+/// (overlapping clouds → more scenes; complementary gaps → fewer).
+pub const CHUNK_MASK_DIM: usize = 32;
+const CHUNK_MASK_CELLS: usize = CHUNK_MASK_DIM * CHUNK_MASK_DIM;
+const CHUNK_MASK_BYTES: usize = CHUNK_MASK_CELLS / 8;
+
+/// Coarse clear/observed bitmap for one (scene, chunk). `clear` and
+/// `valid` are `CHUNK_MASK_CELLS`-bit sets (row-major cells), bit-packed.
+/// Both empty when the scene doesn't observe the chunk — that keeps the
+/// scout cache lean for scenes that only clip a corner of the AOI.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ChunkMask {
+    pub clear: Vec<u8>,
+    pub valid: Vec<u8>,
+}
+
+impl ChunkMask {
+    fn observes(&self) -> bool {
+        !self.valid.is_empty()
+    }
+}
+
+#[inline]
+fn mask_set(bits: &mut [u8], cell: usize) {
+    bits[cell / 8] |= 1 << (cell % 8);
+}
+
+#[inline]
+fn mask_popcount(bits: &[u8]) -> u32 {
+    bits.iter().map(|b| b.count_ones()).sum()
+}
+
+/// Per-chunk coarse clear/observed masks, parallel to [`per_chunk_clear`]
+/// (same row-major chunk order). A cell is `valid` when it covers any
+/// non-nodata pixel and `clear` when the majority of its observed pixels
+/// are clear — so the mask is tile-relative: a cloudless scene reads
+/// ~fully clear within its footprint regardless of how much of the chunk
+/// its tile covers.
+pub fn per_chunk_masks(buf: &[u8], width: u32, height: u32, chunk: u32, kind: QualityKind) -> Vec<ChunkMask> {
+    let (w, h, cs) = (width as usize, height as usize, chunk as usize);
+    let n_cols = w.div_ceil(cs);
+    let n_rows = h.div_ceil(cs);
+    let mut out = Vec::with_capacity(n_cols * n_rows);
+    for cr in 0..n_rows {
+        let (r0, r1) = (cr * cs, (cr * cs + cs).min(h));
+        let ch = r1 - r0;
+        for cc in 0..n_cols {
+            let (c0, c1) = (cc * cs, (cc * cs + cs).min(w));
+            let cw = c1 - c0;
+            let mut clear = vec![0u8; CHUNK_MASK_BYTES];
+            let mut valid = vec![0u8; CHUNK_MASK_BYTES];
+            let mut any = false;
+            for my in 0..CHUNK_MASK_DIM {
+                let cr0 = r0 + my * ch / CHUNK_MASK_DIM;
+                let cr1 = r0 + (my + 1) * ch / CHUNK_MASK_DIM;
+                if cr0 >= cr1 {
+                    continue;
+                }
+                for mx in 0..CHUNK_MASK_DIM {
+                    let cc0 = c0 + mx * cw / CHUNK_MASK_DIM;
+                    let cc1 = c0 + (mx + 1) * cw / CHUNK_MASK_DIM;
+                    if cc0 >= cc1 {
+                        continue;
+                    }
+                    let (mut tot, mut cl) = (0u32, 0u32);
+                    for r in cr0..cr1 {
+                        for &v in &buf[r * w + cc0..r * w + cc1] {
+                            if !kind.is_nodata(v) {
+                                tot += 1;
+                                if kind.is_clear(v) {
+                                    cl += 1;
+                                }
+                            }
+                        }
+                    }
+                    if tot > 0 {
+                        let cell = my * CHUNK_MASK_DIM + mx;
+                        mask_set(&mut valid, cell);
+                        any = true;
+                        if cl * 2 >= tot {
+                            mask_set(&mut clear, cell);
+                        }
+                    }
+                }
+            }
+            out.push(if any { ChunkMask { clear, valid } } else { ChunkMask::default() });
+        }
+    }
+    out
 }
 
 fn quality_to_stats(buf: &[u8], kind: QualityKind) -> (f32, f32) {
@@ -308,6 +502,215 @@ pub fn select_top_k<'a>(
     out
 }
 
+/// A scene selected by the adaptive policy, plus the chunk ids that
+/// requested it. `chunk_ids` lets the fetch path read the scene over
+/// only the windows that need it (Level 2 windowed fetch); Level 1
+/// ignores it and reads the full grid.
+#[derive(Debug, Clone)]
+pub struct AdaptivePick<'a> {
+    pub scene: &'a StacItem,
+    pub clear: f32,
+    pub chunk_ids: Vec<u32>,
+}
+
+/// Adaptive-depth selection driven by per-chunk scout coverage.
+///
+/// For each chunk, rank scenes by their clear fraction *in that chunk*
+/// and add them greedily until the estimated clear coverage
+/// `1 - Π(1-f_i)` reaches `coverage_target` (with at least `min_k`
+/// scenes for best-pixel redundancy), capped at `max_k`. Chunks a few
+/// clear scenes already cover stop early; chronically thin chunks (the
+/// under-observed swath-edge corner) keep pulling scenes up to `max_k`.
+/// This spends fetch depth only where coverage needs it.
+///
+/// Returns one entry per distinct selected scene, carrying the set of
+/// chunks that requested it.
+pub fn select_adaptive<'a>(
+    scenes: &'a [StacItem],
+    stats: &HashMap<String, SceneStats>,
+    partition: Option<&crate::tile_classification::TilePartition>,
+    n_chunks: usize,
+    coverage_target: f32,
+    min_k: usize,
+    max_k: usize,
+) -> Vec<AdaptivePick<'a>> {
+    use std::collections::BTreeMap;
+    // scene index -> chunks that selected it (BTreeMap keeps output stable).
+    let mut chosen: BTreeMap<usize, Vec<u32>> = BTreeMap::new();
+    let target = coverage_target.clamp(0.0, 0.999);
+    let cap = max_k.max(min_k).max(1);
+
+    for chunk in 0..n_chunks as u32 {
+        // Select PER REQUIRED TILE, not over all scenes at once. A scene's
+        // clear pixels sit only in its tile's footprint, so a chunk that
+        // straddles a tile seam needs scenes from *each* covering tile —
+        // pooling them and stopping on aggregate clear-fraction would keep
+        // picking one tile (its half looks "covered") and leave the other
+        // half empty. Per-tile greedy guarantees both halves get scenes.
+        let req_tiles = partition
+            .and_then(|p| p.requirements.get(&chunk))
+            .map(|r| r.required_tiles.as_slice())
+            .filter(|t| !t.is_empty());
+        match req_tiles {
+            Some(tiles) => {
+                for tile in tiles {
+                    let cands = chunk_candidates(scenes, stats, chunk as usize, Some(tile));
+                    greedy_take(chunk, &cands, target, min_k, cap, &mut chosen);
+                }
+            }
+            // No partition / no tile geometry: treat the whole chunk as one
+            // footprint (correct for single-tile AOIs).
+            None => {
+                let cands = chunk_candidates(scenes, stats, chunk as usize, None);
+                greedy_take(chunk, &cands, target, min_k, cap, &mut chosen);
+            }
+        }
+    }
+
+    chosen
+        .into_iter()
+        .map(|(idx, chunk_ids)| AdaptivePick {
+            scene: &scenes[idx],
+            clear: stats
+                .get(&scenes[idx].id)
+                .map(|s| s.mean_clear)
+                .unwrap_or(f32::NAN),
+            chunk_ids,
+        })
+        .collect()
+}
+
+/// Candidate `(scene_idx, &chunk_mask)` for a chunk, optionally restricted
+/// to one MGRS tile. Only scenes that actually observe the chunk (non-empty
+/// mask) with finite stats qualify. Order follows scene index so the
+/// marginal-gain greedy breaks ties deterministically.
+fn chunk_candidates<'s>(
+    scenes: &[StacItem],
+    stats: &'s HashMap<String, SceneStats>,
+    chunk: usize,
+    tile: Option<&str>,
+) -> Vec<(usize, &'s ChunkMask)> {
+    scenes
+        .iter()
+        .enumerate()
+        .filter_map(|(i, s)| {
+            if let Some(t) = tile {
+                if s.mgrs_tile != t {
+                    return None;
+                }
+            }
+            let st = stats.get(&s.id)?;
+            if !st.mean_clear.is_finite() {
+                return None;
+            }
+            let m = st.chunk_masks.get(chunk)?;
+            m.observes().then_some((i, m))
+        })
+        .collect()
+}
+
+/// Mask-based adaptive depth for one (chunk, tile) footprint. Stacks scenes
+/// by greatest marginal clear-cell gain until the union of clear cells
+/// covers `target` of the reachable (observed) area, holding a `min_k`
+/// floor for best-pixel redundancy and a `cap` ceiling. This is where k is
+/// genuinely decided from the SCL pattern: scenes whose clear regions
+/// overlap add little and the chunk keeps pulling depth; scenes that fill
+/// each other's gaps reach the target fast.
+fn greedy_take(
+    chunk: u32,
+    cands: &[(usize, &ChunkMask)],
+    target: f32,
+    min_k: usize,
+    cap: usize,
+    chosen: &mut std::collections::BTreeMap<usize, Vec<u32>>,
+) {
+    if cands.is_empty() {
+        return;
+    }
+    let nbytes = cands.iter().map(|(_, m)| m.valid.len()).max().unwrap_or(0);
+    if nbytes == 0 {
+        return;
+    }
+    // reachable = union of observed cells across this footprint's scenes.
+    let mut reachable = vec![0u8; nbytes];
+    for (_, m) in cands {
+        for (b, &v) in m.valid.iter().enumerate() {
+            reachable[b] |= v;
+        }
+    }
+    let total = mask_popcount(&reachable);
+    if total == 0 {
+        return;
+    }
+    // Observation completeness per candidate: a "full observer" sees
+    // (≥99% of) the chunk's reachable cells; a "partial" only clips part
+    // of it (a swath/AOI edge). We prefer full observers — a chunk should
+    // be built from whole, single-acquisition observations before falling
+    // back to edge slivers, even when a sliver is clearer in its part.
+    // SPX_FULL_PREF=0 disables the preference (all candidates treated as a
+    // single tier ⇒ pure marginal-gain greedy), for A/B comparison.
+    let prefer_full = std::env::var("SPX_FULL_PREF").map(|v| v != "0").unwrap_or(true);
+    let is_full: Vec<bool> = cands
+        .iter()
+        .map(|(_, m)| {
+            if !prefer_full {
+                return true;
+            }
+            let unobserved: u32 = (0..nbytes)
+                .map(|b| (reachable[b] & !m.valid.get(b).copied().unwrap_or(0)).count_ones())
+                .sum();
+            unobserved.saturating_mul(100) <= total
+        })
+        .collect();
+    let mut covered = vec![0u8; nbytes];
+    let mut used = vec![false; cands.len()];
+    let mut taken = 0usize;
+    let gain = |m: &ChunkMask, covered: &[u8]| -> u32 {
+        (0..nbytes)
+            .map(|b| {
+                let c = m.clear.get(b).copied().unwrap_or(0);
+                (c & reachable[b] & !covered[b]).count_ones()
+            })
+            .sum()
+    };
+    while taken < cap {
+        if taken >= min_k && mask_popcount(&covered) as f32 / total as f32 >= target {
+            break;
+        }
+        // Best unused full observer and best unused partial, by marginal
+        // clear-cell gain.
+        let mut best_full: Option<(usize, u32)> = None;
+        let mut best_part: Option<(usize, u32)> = None;
+        for (ci, (_, m)) in cands.iter().enumerate() {
+            if used[ci] {
+                continue;
+            }
+            let g = gain(m, &covered);
+            let slot = if is_full[ci] { &mut best_full } else { &mut best_part };
+            if slot.map_or(true, |(_, bg)| g > bg) {
+                *slot = Some((ci, g));
+            }
+        }
+        // Prefer a full observer that still advances coverage; only when no
+        // full observer adds anything do partials fill the remaining gaps.
+        // The min_k redundancy floor likewise prefers full observers.
+        let pick = match (best_full, best_part) {
+            (Some((cf, gf)), _) if gf > 0 => Some(cf),
+            (_, Some((cp, gp))) if gp > 0 => Some(cp),
+            _ if taken < min_k => best_full.or(best_part).map(|(ci, _)| ci),
+            _ => None,
+        };
+        let Some(ci) = pick else { break };
+        used[ci] = true;
+        taken += 1;
+        let (idx, m) = cands[ci];
+        for b in 0..nbytes {
+            covered[b] |= m.clear.get(b).copied().unwrap_or(0) & reachable[b];
+        }
+        chosen.entry(idx).or_default().push(chunk);
+    }
+}
+
 /// Fetch one band's array (u16) for one scene, with detailed timing.
 /// Reports HTTP / decode / stitch / resample sub-phases via tracing
 /// when RUST_LOG=debug; otherwise silent so production runs aren't
@@ -426,7 +829,44 @@ pub async fn fetch_band(
         band = %band_asset, n_tiles, dt_open, dt_read, dt_stitch, dt_resample,
         "fetch_band timing"
     );
+    // Harmonize the Sentinel-2 N0400 BOA_ADD_OFFSET so every processing
+    // baseline shares the reflectance = DN / 10000 convention.
+    let offset = s2_boa_offset(scene);
+    let out = if offset > 0 {
+        out.into_iter().map(|v| v.saturating_sub(offset)).collect()
+    } else {
+        out
+    };
     Ok(Some(out))
+}
+
+/// Sentinel-2 L2A processing baseline N0400 (≥ 04.00, ~2022-01-25) bakes a
+/// `+1000` DN `BOA_ADD_OFFSET` into the raster: true reflectance is
+/// `(DN - 1000) / 10000`, while earlier baselines use `DN / 10000`. We
+/// subtract it at fetch (saturating at 0) so all baselines land on the same
+/// `DN / 10000` scale and multi-year composites are comparable. Other
+/// products (HLS, MCD43A4) carry no such offset → 0.
+pub fn s2_boa_offset(scene: &StacItem) -> u16 {
+    if scene.collection != "sentinel-2-l2a" {
+        return 0;
+    }
+    // Prefer the explicit STAC property; fall back to the `N####` token in
+    // the Sen2Cor-style id (e.g. `..._N0400_...`) for providers that omit it.
+    let from_prop = scene
+        .properties
+        .get("s2:processing_baseline")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<f32>().ok());
+    let from_id = scene.id.split('_').find_map(|t| {
+        t.strip_prefix('N')
+            .filter(|d| d.len() == 4 && d.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|d| d.parse::<f32>().ok())
+            .map(|n| n / 100.0)
+    });
+    match from_prop.or(from_id) {
+        Some(baseline) if baseline >= 4.0 => 1000,
+        _ => 0,
+    }
 }
 
 /// Quality raster at full resolution for fetch-time best-pixel

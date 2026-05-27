@@ -16,3 +16,11 @@ __pycache__/
 .surface-cache/
 site/
 .benchmark-cache/
+
+# Large local composite outputs / build artifacts (not for the repo)
+egypt_5y_prior/
+egypt_5y_prior_adaptive/
+.real-builds/
+.real-builds-tile-aware/
+# Local agent/editor settings
+.claude/

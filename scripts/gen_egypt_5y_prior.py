@@ -11,17 +11,20 @@ from pathlib import Path
 
 import numpy as np
 
-# NOTE: rasterio is imported lazily inside _write_geotiffs(), AFTER all Rust
-# building finishes. Importing rasterio (and its GDAL/PROJ) into the process
-# before the Rust `proj` call corrupts libproj's global context and aborts the
-# WGS84->UTM transform. Building first, writing second, keeps them apart.
+# Import surface_priors_rs first: its package init pins PROJ_DATA so rasterio's
+# GDAL/PROJ no longer clobbers the native WGS84->UTM transform — import order
+# is no longer load-bearing, so rasterio can be imported normally up top.
 import surface_priors_rs as spx
+import rasterio
+from affine import Affine
+from rasterio.crs import CRS
 
 BBOX = (30.5, 30.5, 31.6, 31.5)  # Nile Delta, WGS84
 YEARS = [2020, 2021, 2022, 2023, 2024]
 MONTH = 7  # July — the month used across the egypt-case benchmarks
 RESOLUTION = 60.0
-TOP_K = 3
+TOP_K = 6  # 3 left the under-observed SE swath-edge corner empty in 4/5 years;
+           # 6 includes the additional clear July passes that cover it.
 ENDPOINT = "pc"
 BANDS = ["coastal", "blue", "green", "red", "nir", "swir16", "swir22"]
 DISK_CACHE = "/tmp/spx-egypt-5y"
@@ -29,11 +32,6 @@ OUT_DIR = Path("egypt_5y_prior")
 
 
 def _write_geotiffs(results) -> list[dict]:
-    # Imported here, not at module top — see the note above.
-    import rasterio
-    from affine import Affine
-    from rasterio.crs import CRS
-
     summary = []
     for r in results:
         year, month = r["year"], r["month"]
@@ -55,6 +53,16 @@ def _write_geotiffs(results) -> list[dict]:
             for i, name in enumerate(band_names, start=1):
                 dst.write(stack[i - 1], i)
                 dst.set_band_description(i, name)
+            # Reflectance = DN * 0.0001 (S2 N0400 +1000 offset harmonized in
+            # the pipeline). GDAL-aware readers pick these up automatically.
+            n = len(band_names)
+            dst.scales = [0.0001] * n
+            dst.offsets = [0.0] * n
+            dst.update_tags(
+                reflectance_scale="0.0001",
+                reflectance_offset="0.0",
+                note="surface reflectance = DN * 0.0001; S2 N0400 +1000 BOA offset harmonized",
+            )
 
         valid = int((np.asarray(r["observation_count"]) > 0).sum())
         rec = {
@@ -62,6 +70,7 @@ def _write_geotiffs(results) -> list[dict]:
             "grid": f"{h}x{w}", "epsg": g["epsg"], "resolution": g["resolution"],
             "n_scenes": len(r["source_ids"]),
             "valid_pixels": valid, "total_pixels": h * w,
+            "reflectance_scale": 0.0001, "reflectance_offset": 0.0,
             "timings": dict(r["timings"]),
         }
         summary.append(rec)

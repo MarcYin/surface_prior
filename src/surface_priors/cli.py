@@ -163,18 +163,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Maximum scenes per chunk in the selection plan.",
     )
     build.add_argument(
-        "--min-usable-fraction",
-        type=float,
-        default=0.5,
-        help="Drop (scene, chunk) pairs with usable_fraction below this floor.",
-    )
-    build.add_argument(
         "--fetch-workers",
         type=_positive_int,
-        default=8,
+        default=32,
         help=(
-            "Outer worker threads used for parallel chunk fetching. STAC sources "
-            "multiply this by band_workers (default 12) for total concurrent HTTP "
+            "Outer worker threads used for parallel scene fetching. STAC sources "
+            "multiply this by band_workers (default 3) for total concurrent HTTP "
             "calls; keep the product ≤100 to avoid Element84 rate limits."
         ),
     )
@@ -380,7 +374,6 @@ def _provider_config(args: argparse.Namespace) -> ProviderConfig:
         chunk_size=getattr(args, "chunk_size", 512),
         selection_policy=SelectionPolicy(
             top_k=getattr(args, "top_k", 3),
-            min_usable_fraction=getattr(args, "min_usable_fraction", 0.5),
         ),
         fetch_workers=getattr(args, "fetch_workers", 8),
         emit_uncertainty=bool(getattr(args, "with_uncertainty", False)),

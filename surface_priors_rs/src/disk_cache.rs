@@ -78,7 +78,10 @@ impl DiskCache {
     ) -> String {
         use sha1::{Digest, Sha1};
         let mut h = Sha1::new();
-        h.update(b"schema:1\0scout\0");
+        // schema:3 — each SceneChunkStat now also carries a coarse
+        // clear/observed bitmap (clear_mask/valid_mask) for mask-based
+        // adaptive-depth selection, on top of schema:2's per-chunk scalars.
+        h.update(b"schema:3\0scout\0");
         h.update(stac_url.as_bytes());
         h.update(b"\0");
         h.update(collection.as_bytes());

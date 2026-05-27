@@ -308,6 +308,21 @@ fn ifd_to_level(ifd: &Ifd) -> OverviewLevel {
 /// to amortise per-request HTTP overhead. The configurable gap allows
 /// a small amount of "wasted" intermediate bytes to be transferred if
 /// it spares us a round-trip.
+/// Byte gap below which adjacent tiles are merged into one range GET.
+/// Defaults to 4 KiB: measured sweeps (4 KiB → 1 MiB) showed bigger gaps
+/// barely cut the GET count and didn't improve wall — at high concurrency
+/// HTTP/2 multiplexing already hides per-request latency, and over-merging
+/// re-reads bytes and costs parallelism. Override via `SPX_MERGE_GAP`.
+fn merge_gap() -> u64 {
+    static G: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *G.get_or_init(|| {
+        std::env::var("SPX_MERGE_GAP")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(4 * 1024)
+    })
+}
+
 pub async fn read_tiles(
     http: Arc<reqwest::Client>,
     url: Arc<String>,
@@ -324,11 +339,17 @@ pub async fn read_tiles(
     let bps = level.bytes_per_sample as usize;
 
     // Maximum number of bytes to "tolerate" between two tiles in a
-    // merged range request. Small gap so we only merge truly adjacent
-    // tiles (HTTP/2 multiplexing handles parallel small ranges fine;
-    // over-merging eats parallelism without saving wall time).
-    const MERGE_GAP: u64 = 4 * 1024;
-    let groups = coalesce_ranges(&tiles, MERGE_GAP);
+    // merged range request. Bigger gap => fewer, larger HTTP GETs (fewer
+    // round trips, the dominant cost on RTT-bound links) at the cost of
+    // re-reading some inter-tile bytes and less request parallelism.
+    // Override with SPX_MERGE_GAP (bytes) to tune per network.
+    let groups = coalesce_ranges(&tiles, merge_gap());
+    // n_groups = actual HTTP range-GETs after coalescing contiguous tiles;
+    // this (not n_tiles) is the RTT-bound request count.
+    tracing::debug!(n_tiles = tiles.len(), n_groups = groups.len(), "read_tiles coalesce");
+    // n_groups = actual HTTP range-GETs after coalescing contiguous tiles;
+    // this (not n_tiles) is the RTT-bound request count.
+    tracing::debug!(n_tiles = tiles.len(), n_groups = groups.len(), "read_tiles coalesce");
 
     // Detect runtime shape once. On the current-thread runtime we run
     // decode inline (blocking the reactor briefly is harmless on 1 CPU

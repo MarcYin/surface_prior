@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Optional, Sequence
 
@@ -8,7 +10,11 @@ import numpy as np
 from surface_priors.chunks import ChunkWindow, chunk_grid
 from surface_priors.quality import QualityRules, score_pixels, valid_pixel_mask
 from surface_priors.selection import SelectionPlan
+from surface_priors.tile_classification import summarise as summarise_partition
 from surface_priors.types import GridSpec, Observation, PriorComposite
+
+
+SceneFetcher = Callable[[int], Mapping[int, Optional[Observation]]]
 
 
 @dataclass(frozen=True)
@@ -248,6 +254,9 @@ class ChunkedCompositor:
             attrs["requested_chunk_size"] = int(layout.chunk_size)
         if plan.empty_chunks:
             attrs["empty_chunk_count"] = len(plan.empty_chunks)
+        tile_summary = summarise_partition(plan.partition, layout)
+        if tile_summary.get("tile_aware"):
+            attrs["tile_partition"] = dict(tile_summary)
 
         return PriorComposite(
             product_id=product_id,
@@ -264,6 +273,205 @@ class ChunkedCompositor:
         )
 
 
+    def compose_pipelined(
+        self,
+        *,
+        product_id: str,
+        grid: GridSpec,
+        band_names: Sequence[str],
+        plan: SelectionPlan,
+        fetch_scene: SceneFetcher,
+        fetch_workers: int = 32,
+        compose_workers: int = 4,
+    ) -> PriorComposite:
+        """Drive fetch and per-chunk compose concurrently.
+
+        Submits one fetch task per scene (each scene contributes to one
+        or more chunks via tile-aware selection). As each fetch returns,
+        any chunks whose dependent scenes have all completed are pushed
+        onto the compose pool. The compose work overlaps with the long
+        tail of fetches instead of waiting for the whole prefetch to
+        finish, hiding ~0.8s of per-build compose behind fetch time.
+        """
+
+        band_names = tuple(str(band) for band in band_names)
+        layout = plan.layout
+        if layout.grid_shape != grid.shape:
+            raise ValueError(
+                f"selection plan layout shape {layout.grid_shape} does not match grid shape {grid.shape}"
+            )
+        band_count = len(band_names)
+        height, width = grid.shape
+
+        data = np.full((band_count, height, width), np.nan, dtype=self.output_dtype)
+        uncertainty = np.full((band_count, height, width), np.nan, dtype="float32")
+        quality = np.full((height, width), self.quality_rules.nodata_quality, dtype="uint16")
+        sample_index = np.full((height, width), -1, dtype="int16")
+        selected_observation = np.full((height, width), -1, dtype="int16")
+        observation_count = np.zeros((height, width), dtype="uint16")
+        source_items_by_scene: dict[int, Mapping[str, Any]] = {}
+        items_lock = threading.Lock()
+
+        inner = PriorCompositor(
+            quality_rules=self.quality_rules,
+            output_dtype=self.output_dtype,
+            emit_uncertainty=self.emit_uncertainty,
+        )
+
+        # Per-chunk dependency tracker: remaining unresolved scenes.
+        remaining: dict[int, set[int]] = {
+            int(chunk_id): {int(s) for s in scenes}
+            for chunk_id, scenes in plan.selected.items()
+        }
+        observations: dict[tuple[int, int], Optional[Observation]] = {}
+
+        by_scene: dict[int, list[int]] = {}
+        for chunk_id, scenes in plan.selected.items():
+            for scene_index in scenes:
+                by_scene.setdefault(int(scene_index), []).append(int(chunk_id))
+        if not by_scene:
+            return self._empty_composite(
+                product_id=product_id,
+                grid=grid,
+                band_names=band_names,
+                layout=layout,
+                plan=plan,
+            )
+
+        state_lock = threading.Lock()
+        compose_pool = ThreadPoolExecutor(
+            max_workers=max(1, int(compose_workers)),
+            thread_name_prefix="compose",
+        )
+        compose_futures = []
+
+        def compose_chunk(chunk_id: int) -> None:
+            window = layout[chunk_id]
+            local_to_global: list[int] = []
+            chunk_observations: list[Observation] = []
+            for scene_index in plan.selected[chunk_id]:
+                observation = observations.pop((int(scene_index), int(chunk_id)), None)
+                if observation is None:
+                    continue
+                chunk_observations.append(observation)
+                local_to_global.append(int(scene_index))
+            if not chunk_observations:
+                return
+            sub_grid = chunk_grid(grid, window)
+            sub_composite = inner.compose(
+                product_id=product_id,
+                grid=sub_grid,
+                band_names=band_names,
+                observations=chunk_observations,
+            )
+            _stitch_chunk(
+                window=window,
+                local_to_global=local_to_global,
+                sub_composite=sub_composite,
+                data=data,
+                uncertainty=uncertainty,
+                quality=quality,
+                sample_index=sample_index,
+                selected_observation=selected_observation,
+                observation_count=observation_count,
+                source_items_by_scene=source_items_by_scene,
+                items_lock=items_lock,
+            )
+
+        def fetch_and_dispatch(scene_index: int) -> None:
+            results = fetch_scene(int(scene_index))
+            ready: list[int] = []
+            with state_lock:
+                for chunk_id, observation in results.items():
+                    cid = int(chunk_id)
+                    observations[(int(scene_index), cid)] = observation
+                    deps = remaining.get(cid)
+                    if deps is None:
+                        continue
+                    deps.discard(int(scene_index))
+                    if not deps:
+                        ready.append(cid)
+                        remaining.pop(cid, None)
+                for cid in ready:
+                    compose_futures.append(compose_pool.submit(compose_chunk, cid))
+
+        try:
+            with ThreadPoolExecutor(
+                max_workers=max(1, int(fetch_workers)),
+                thread_name_prefix="fetch",
+            ) as fetch_pool:
+                fetch_futures = [
+                    fetch_pool.submit(fetch_and_dispatch, scene_index)
+                    for scene_index in by_scene
+                ]
+                for future in fetch_futures:
+                    future.result()
+            for future in compose_futures:
+                future.result()
+        finally:
+            compose_pool.shutdown(wait=True)
+
+        source_items = tuple(
+            source_items_by_scene[index] for index in sorted(source_items_by_scene)
+        )
+        attrs: dict[str, Any] = {
+            "compositor": "chunked_best_pixel_v2",
+            "chunk_size": int(layout.applied_chunk_size),
+        }
+        if layout.effective_chunk_size is not None:
+            attrs["requested_chunk_size"] = int(layout.chunk_size)
+        if plan.empty_chunks:
+            attrs["empty_chunk_count"] = len(plan.empty_chunks)
+        tile_summary = summarise_partition(plan.partition, layout)
+        if tile_summary.get("tile_aware"):
+            attrs["tile_partition"] = dict(tile_summary)
+        return PriorComposite(
+            product_id=product_id,
+            grid=grid,
+            band_names=band_names,
+            data=data,
+            uncertainty=uncertainty,
+            quality=quality,
+            sample_index=sample_index,
+            selected_observation=selected_observation,
+            observation_count=observation_count,
+            source_items=source_items,
+            attrs=attrs,
+        )
+
+    def _empty_composite(
+        self,
+        *,
+        product_id: str,
+        grid: GridSpec,
+        band_names: Sequence[str],
+        layout,
+        plan: SelectionPlan,
+    ) -> PriorComposite:
+        band_count = len(band_names)
+        height, width = grid.shape
+        attrs: dict[str, Any] = {
+            "compositor": "chunked_best_pixel_v2",
+            "chunk_size": int(layout.applied_chunk_size),
+            "empty": True,
+        }
+        if plan.empty_chunks:
+            attrs["empty_chunk_count"] = len(plan.empty_chunks)
+        return PriorComposite(
+            product_id=product_id,
+            grid=grid,
+            band_names=band_names,
+            data=np.full((band_count, height, width), np.nan, dtype=self.output_dtype),
+            uncertainty=np.full((band_count, height, width), np.nan, dtype="float32"),
+            quality=np.full((height, width), self.quality_rules.nodata_quality, dtype="uint16"),
+            sample_index=np.full((height, width), -1, dtype="int16"),
+            selected_observation=np.full((height, width), -1, dtype="int16"),
+            observation_count=np.zeros((height, width), dtype="uint16"),
+            source_items=(),
+            attrs=attrs,
+        )
+
+
 def _stitch_chunk(
     *,
     window: ChunkWindow,
@@ -276,6 +484,7 @@ def _stitch_chunk(
     selected_observation: np.ndarray,
     observation_count: np.ndarray,
     source_items_by_scene: dict[int, Mapping[str, Any]],
+    items_lock: Optional[threading.Lock] = None,
 ) -> None:
     row_slice = window.row_slice
     col_slice = window.col_slice
@@ -291,9 +500,15 @@ def _stitch_chunk(
         mapped = np.where(local == local_index, global_index, mapped)
     selected_observation[row_slice, col_slice] = mapped.astype("int16", copy=False)
 
-    for local_index, item in enumerate(sub_composite.source_items):
-        global_index = local_to_global[local_index]
-        source_items_by_scene.setdefault(global_index, item)
+    if items_lock is None:
+        for local_index, item in enumerate(sub_composite.source_items):
+            global_index = local_to_global[local_index]
+            source_items_by_scene.setdefault(global_index, item)
+    else:
+        with items_lock:
+            for local_index, item in enumerate(sub_composite.source_items):
+                global_index = local_to_global[local_index]
+                source_items_by_scene.setdefault(global_index, item)
 
 
 def _expand_uncertainty(uncertainty: np.ndarray, band_count: int) -> np.ndarray:

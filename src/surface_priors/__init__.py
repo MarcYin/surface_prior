@@ -17,11 +17,16 @@ from surface_priors.selection import (
     SelectionPolicy,
     select,
 )
+from surface_priors.tile_classification import (
+    ChunkTileRequirement,
+    TilePartition,
+)
 from surface_priors.types import GridSpec, Observation, PriorComposite, PriorProduct
 
 __all__ = [
     "__version__",
     "ChunkLayout",
+    "ChunkTileRequirement",
     "ChunkWindow",
     "ChunkedCompositor",
     "EncodingConfig",
@@ -36,6 +41,7 @@ __all__ = [
     "SceneChunkStats",
     "SelectionPlan",
     "SelectionPolicy",
+    "TilePartition",
     "decode_prior",
     "decode_relative_uncertainty",
     "encode_prior",
