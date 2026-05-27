@@ -32,10 +32,10 @@ jobs:
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-latest
             manylinux: "2_28"
-            rustflags: "-C target-cpu=generic"
+            rustflags: ""
           - target: aarch64-apple-darwin
             runner: macos-14
-            rustflags: "-C target-cpu=apple-m1"
+            rustflags: ""
           - target: x86_64-apple-darwin
             runner: macos-13
             rustflags: "-C target-cpu=x86-64-v3"
@@ -74,9 +74,24 @@ jobs:
           manylinux: ${{ matrix.manylinux }}
           args: --release --features python --out dist
           before-script-linux: |
-            # manylinux_2_28 is AlmaLinux 8 / RHEL 8 based.
-            dnf install -y epel-release
-            dnf install -y proj-devel sqlite-devel clang
+            # Install PROJ for proj-sys. Detect the container's package
+            # manager — the x86_64 manylinux_2_28 image is AlmaLinux (dnf),
+            # but the aarch64 cross image may differ (microdnf / yum / apt).
+            set -e
+            if command -v dnf >/dev/null 2>&1; then
+              dnf install -y epel-release || true
+              dnf install -y proj-devel sqlite-devel clang
+            elif command -v microdnf >/dev/null 2>&1; then
+              microdnf install -y epel-release || true
+              microdnf install -y proj-devel sqlite-devel clang
+            elif command -v yum >/dev/null 2>&1; then
+              yum install -y epel-release || true
+              yum install -y proj-devel sqlite-devel clang
+            elif command -v apt-get >/dev/null 2>&1; then
+              apt-get update && apt-get install -y libproj-dev libsqlite3-dev clang
+            else
+              echo "no known package manager found in build container" >&2; exit 1
+            fi
           rust-toolchain: stable
           # Override .cargo/config.toml `target-cpu=native` per-arch so the
           # wheel is portable (auditwheel/delocate bundle libproj).

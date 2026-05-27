@@ -1,5 +1,7 @@
-[build]
-# Compile for the host's full instruction set (AVX2, FMA, etc) on
-# release builds. The binary won't be portable to older CPUs but the
-# resampler and predictor benefit from AVX2/FMA when available.
-rustflags = ["-C", "target-cpu=native"]
+# No global rustflags. The AVX2/FMA hot path is `#[target_feature]`-gated
+# so it works regardless of `target-cpu`; forcing `target-cpu=native` here
+# made builds non-portable (SIGILL on older CPUs) and leaked into CI cross
+# builds (broke `ring` on macOS, ARM). Release wheels set a portable
+# per-target baseline in .github/workflows/rust-release.yml
+# (x86-64-v3 for x86_64, default for ARM). For a fast local build:
+#   RUSTFLAGS="-C target-cpu=native" cargo build --release
