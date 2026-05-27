@@ -23,16 +23,15 @@ jobs:
       matrix:
         include:
           # x86_64 keeps the AVX2/FMA hot path (x86-64-v3 baseline);
-          # ARM targets compile the scalar resampler fallback
+          # macOS arm64 compiles the scalar resampler fallback
           # (grid.rs gates AVX2 behind cfg(target_arch = "x86_64")).
+          # aarch64-linux is intentionally omitted: its cross image lacks
+          # PROJ >= 9, triggering a slow/fragile from-source PROJ build
+          # under QEMU. aarch64-linux users install from the sdist.
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
             manylinux: "2_28"
             rustflags: "-C target-cpu=x86-64-v3"
-          - target: aarch64-unknown-linux-gnu
-            runner: ubuntu-latest
-            manylinux: "2_28"
-            rustflags: ""
           - target: aarch64-apple-darwin
             runner: macos-14
             rustflags: ""
@@ -45,11 +44,6 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-
-      # aarch64 linux wheel cross-builds in an emulated manylinux container.
-      - name: Set up QEMU (aarch64 linux)
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        uses: docker/setup-qemu-action@v3
 
       # macOS: PROJ via Homebrew (Linux installs it inside the manylinux
       # container in before-script-linux below); maturin bundles the dylib.
