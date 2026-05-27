@@ -1,11 +1,11 @@
 [package]
-name = "surface_priors_rs"
+name = "bestpixel"
 version = "0.1.0"
 edition = "2021"
 description = "Production Rust port of the surface_priors monthly composite pipeline."
 
 [lib]
-name = "surface_priors_rs"
+name = "bestpixel"
 path = "src/lib.rs"
 crate-type = ["cdylib", "rlib"]
 

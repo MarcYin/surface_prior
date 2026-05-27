@@ -74,6 +74,16 @@ impl QualityKind {
         }
     }
 
+    /// A byte that `is_nodata` treats as nodata. Used to pad quality
+    /// buffers outside a windowed (Level 2) fetch so compose skips those
+    /// pixels.
+    pub fn nodata_fill(&self) -> u8 {
+        match self {
+            Self::Scl => 0,
+            Self::Fmask | Self::ModisMandatory => 255,
+        }
+    }
+
     pub fn is_clear(&self, v: u8) -> bool {
         match self {
             // SCL: dark vegetation (4), vegetation (5), bare (6), snow (11).

@@ -3,15 +3,23 @@ requires = ["maturin>=1.4,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "surface-priors-rs"
+name = "bestpixel"
 version = "0.1.0"
-description = "Rust-backed Sentinel-2 L2A monthly composite builder; returns numpy arrays."
+description = "Fast Rust-backed best-pixel cloud-free composites from STAC/COG sources (Sentinel-2 L2A, HLS, MCD43A4); returns numpy arrays."
+readme = "README.md"
 requires-python = ">=3.9"
+license = { text = "MIT" }
+keywords = ["sentinel-2", "stac", "cog", "composite", "best-pixel", "cloud-free", "remote-sensing", "earth-observation"]
 classifiers = [
     "Programming Language :: Rust",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: Implementation :: CPython",
+    "Topic :: Scientific/Engineering :: GIS",
+    "Intended Audience :: Science/Research",
 ]
+
+[project.urls]
+Repository = "https://github.com/MarcYin/surface_prior"
 
 [tool.maturin]
 # Build the cdylib feature-gated under "python"; this leaves the
@@ -19,6 +27,12 @@ classifiers = [
 # spx-build artefact.
 features = ["python"]
 bindings = "pyo3"
+# Mixed layout: hand-written Python package in python/ ships alongside the
+# compiled extension. It re-exports the Rust module unchanged and adds a
+# type stub (__init__.pyi) documenting build_composite /
+# build_monthly_composites — including the adaptive-depth + windowed-fetch
+# params — so they're discoverable and typed from Python.
+python-source = "python"
 # We don't want the spx-build binary inside the wheel; it ships as
 # a separate native binary.
 exclude = [

@@ -4,6 +4,7 @@ from typing import Optional, Protocol, Sequence, Tuple
 
 from surface_priors.chunks import ChunkLayout
 from surface_priors.selection import SceneChunkStats, SelectionPlan
+from surface_priors.tile_classification import TilePartition
 from surface_priors.types import GridSpec, Observation
 
 
@@ -70,3 +71,18 @@ class ChunkedObservationSource(Protocol):
         band_names: Sequence[str],
     ) -> Optional[int]:
         """Preferred chunk-size snap derived from storage block size, if known."""
+
+    def tile_partition(
+        self,
+        *,
+        grid: GridSpec,
+        layout: ChunkLayout,
+    ) -> Optional[TilePartition]:
+        """Classify each chunk by the source tiles needed to cover it.
+
+        Sources whose scenes each cover only one tile (Sentinel-2 L2A on
+        STAC, MGRS-tiled products in general) implement this so that
+        selection can take top-K per required tile and union, avoiding
+        seam-stripe gaps. Sources with no tile concept omit the method or
+        return ``None`` — selection then ranks globally per chunk.
+        """

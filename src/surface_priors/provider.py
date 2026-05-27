@@ -11,6 +11,7 @@ from surface_priors.composite import ChunkedCompositor, PriorCompositor
 from surface_priors.persistence import CompositeStore, stable_json_hash
 from surface_priors.selection import SelectionPlan, SelectionPolicy, select
 from surface_priors.sources.base import ObservationSource
+from surface_priors.tile_classification import TilePartition
 from surface_priors.types import (
     DEFAULT_BANDS,
     DEFAULT_NATIVE_CRS,
@@ -35,7 +36,7 @@ class ProviderConfig:
     metadata: Mapping[str, Any] = field(default_factory=dict)
     chunk_size: int = 512
     selection_policy: SelectionPolicy = field(default_factory=SelectionPolicy)
-    fetch_workers: int = 8
+    fetch_workers: int = 32
     emit_uncertainty: bool = False
 
 
@@ -138,11 +139,32 @@ class Provider:
         if temporal_filter is not None and _scout_accepts_temporal_filter(source):
             scout_kwargs["temporal_filter"] = temporal_filter
         stats = source.scout(**scout_kwargs)
+        partition = _source_tile_partition(source, grid=grid, layout=layout)
         plan = select(
             layout=layout,
             stats=stats,
             policy=self.config.selection_policy,
+            partition=partition,
         )
+        compositor = ChunkedCompositor(
+            quality_rules=self.config.compositor.quality_rules,
+            output_dtype=self.config.compositor.output_dtype,
+            emit_uncertainty=self._resolved_emit_uncertainty(),
+        )
+
+        scene_fetcher = _scene_fetcher_for(
+            source=source, grid=grid, plan=plan, band_names=band_names
+        )
+        if scene_fetcher is not None:
+            return compositor.compose_pipelined(
+                product_id=product_id,
+                grid=grid,
+                band_names=band_names,
+                plan=plan,
+                fetch_scene=scene_fetcher,
+                fetch_workers=self.config.fetch_workers,
+            )
+
         cache = _prefetch_chunks(
             source=source,
             grid=grid,
@@ -154,11 +176,6 @@ class Provider:
         def chunk_loader(scene_index: int, chunk_id: int) -> Optional[Observation]:
             return cache.get((int(scene_index), int(chunk_id)))
 
-        compositor = ChunkedCompositor(
-            quality_rules=self.config.compositor.quality_rules,
-            output_dtype=self.config.compositor.output_dtype,
-            emit_uncertainty=self._resolved_emit_uncertainty(),
-        )
         return compositor.compose(
             product_id=product_id,
             grid=grid,
@@ -254,7 +271,6 @@ class Provider:
             payload["chunking"] = {
                 "chunk_size": int(self.config.chunk_size),
                 "top_k": int(policy.top_k),
-                "min_usable_fraction": float(policy.min_usable_fraction),
                 "min_clear_score": float(policy.min_clear_score),
             }
         return payload
@@ -313,7 +329,81 @@ def _is_chunked_source(source: Any) -> bool:
     )
 
 
+def _scene_fetcher_for(
+    *,
+    source: Any,
+    grid: GridSpec,
+    plan: SelectionPlan,
+    band_names: Sequence[str],
+):
+    """Adapter for pipelined compose: scene_index → {chunk_id: Observation}."""
+
+    fetch_for_scene = getattr(source, "fetch_selected_for_scene", None)
+    if not callable(fetch_for_scene):
+        return None
+    by_scene: dict[int, list[int]] = {}
+    for chunk_id, scenes in plan.selected.items():
+        for scene_index in scenes:
+            by_scene.setdefault(int(scene_index), []).append(int(chunk_id))
+
+    def fetch(scene_index: int):
+        chunk_ids = by_scene.get(int(scene_index), [])
+        if not chunk_ids:
+            return {}
+        return fetch_for_scene(
+            grid=grid,
+            plan=plan,
+            band_names=band_names,
+            scene_index=scene_index,
+            chunk_ids=chunk_ids,
+        )
+
+    return fetch
+
+
+def _source_tile_partition(
+    source: Any,
+    *,
+    grid: GridSpec,
+    layout: ChunkLayout,
+) -> Optional[TilePartition]:
+    fn = getattr(source, "tile_partition", None)
+    if not callable(fn):
+        return None
+    try:
+        return fn(grid=grid, layout=layout)
+    except NotImplementedError:
+        return None
+
+
 def _prefetch_chunks(
+    *,
+    source: Any,
+    grid: GridSpec,
+    plan: SelectionPlan,
+    band_names: Sequence[str],
+    workers: int,
+) -> dict[tuple[int, int], Optional[Observation]]:
+    if not plan.selected:
+        return {}
+    if callable(getattr(source, "fetch_selected_for_scene", None)):
+        return _prefetch_chunks_by_scene(
+            source=source,
+            grid=grid,
+            plan=plan,
+            band_names=band_names,
+            workers=workers,
+        )
+    return _prefetch_chunks_per_pair(
+        source=source,
+        grid=grid,
+        plan=plan,
+        band_names=band_names,
+        workers=workers,
+    )
+
+
+def _prefetch_chunks_per_pair(
     *,
     source: Any,
     grid: GridSpec,
@@ -347,6 +437,51 @@ def _prefetch_chunks(
     with ThreadPoolExecutor(max_workers=int(workers)) as pool:
         for key, value in pool.map(fetch, tasks):
             cache[key] = value
+    return cache
+
+
+def _prefetch_chunks_by_scene(
+    *,
+    source: Any,
+    grid: GridSpec,
+    plan: SelectionPlan,
+    band_names: Sequence[str],
+    workers: int,
+) -> dict[tuple[int, int], Optional[Observation]]:
+    """One open per band COG per scene, regardless of how many chunks that
+    scene serves. Falls out cleanly with tile-aware fan-out where one
+    scene typically feeds multiple chunks."""
+
+    by_scene: dict[int, list[int]] = {}
+    for chunk_id, scenes in plan.selected.items():
+        for scene_index in scenes:
+            by_scene.setdefault(int(scene_index), []).append(int(chunk_id))
+    if not by_scene:
+        return {}
+
+    def fetch_scene(scene_index: int):
+        chunk_ids = by_scene[scene_index]
+        results = source.fetch_selected_for_scene(
+            grid=grid,
+            plan=plan,
+            band_names=band_names,
+            scene_index=scene_index,
+            chunk_ids=chunk_ids,
+        )
+        return scene_index, results
+
+    cache: dict[tuple[int, int], Optional[Observation]] = {}
+    scenes_iter = list(by_scene.keys())
+    if workers <= 1:
+        for scene_index in scenes_iter:
+            sid, results = fetch_scene(scene_index)
+            for chunk_id, observation in results.items():
+                cache[(int(sid), int(chunk_id))] = observation
+        return cache
+    with ThreadPoolExecutor(max_workers=int(workers)) as pool:
+        for sid, results in pool.map(fetch_scene, scenes_iter):
+            for chunk_id, observation in results.items():
+                cache[(int(sid), int(chunk_id))] = observation
     return cache
 
 

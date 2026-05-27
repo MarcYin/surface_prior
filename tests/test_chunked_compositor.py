@@ -99,7 +99,7 @@ def test_empty_chunks_left_as_nodata():
         SceneChunkStats(scene_index=0, chunk_id=2, usable_fraction=0.0, mean_clear=float("nan")),
         SceneChunkStats(scene_index=0, chunk_id=3, usable_fraction=0.0, mean_clear=float("nan")),
     ]
-    plan = select(layout=layout, stats=stats, policy=SelectionPolicy(top_k=1, min_usable_fraction=0.5))
+    plan = select(layout=layout, stats=stats, policy=SelectionPolicy(top_k=1))
 
     def chunk_loader(scene_index, chunk_id):
         window = layout[chunk_id]

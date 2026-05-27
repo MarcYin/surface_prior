@@ -1,7 +1,7 @@
 """Quick regression: build a 1-month composite via each endpoint."""
 import time
 
-import surface_priors_rs as spx
+import bestpixel as spx
 
 for endpoint in ["pc", "hls", "mcd43a4"]:
     res = 500.0 if endpoint == "mcd43a4" else 60.0

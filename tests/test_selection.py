@@ -9,6 +9,7 @@ from surface_priors.selection import (
     SelectionPolicy,
     select,
 )
+from surface_priors.tile_classification import ChunkTileRequirement, TilePartition
 from surface_priors.types import GridSpec
 
 
@@ -32,33 +33,36 @@ def test_select_keeps_top_k_by_mean_clear(two_by_two_layout):
     assert 0 not in plan.empty_chunks
 
 
-def test_select_filters_below_min_usable_fraction(two_by_two_layout):
+def test_select_drops_zero_usable_fraction(two_by_two_layout):
     stats = [
         SceneChunkStats(scene_index=0, chunk_id=0, usable_fraction=0.95, mean_clear=0.7),
-        SceneChunkStats(scene_index=1, chunk_id=0, usable_fraction=0.30, mean_clear=0.99),
-        SceneChunkStats(scene_index=2, chunk_id=0, usable_fraction=0.51, mean_clear=0.40),
+        SceneChunkStats(scene_index=1, chunk_id=0, usable_fraction=0.0, mean_clear=0.99),
+        SceneChunkStats(scene_index=2, chunk_id=0, usable_fraction=0.05, mean_clear=0.40),
     ]
 
     plan = select(
         layout=two_by_two_layout,
         stats=stats,
-        policy=SelectionPolicy(top_k=3, min_usable_fraction=0.5),
+        policy=SelectionPolicy(top_k=3),
     )
 
-    # Scene 1 fails the usable_fraction floor and must be excluded.
+    # Scene 1 is dropped (no contribution); scene 2's tiny usable_fraction is
+    # kept because tile-aware selection no longer applies a global floor.
     assert plan.scenes_for(0) == (0, 2)
 
 
 def test_select_marks_empty_chunks_when_no_scene_passes(two_by_two_layout):
+    # Only chunk 1 sees any scene candidates, and they all have 0 usable
+    # contribution — the chunk stays empty.
     stats = [
-        SceneChunkStats(scene_index=0, chunk_id=1, usable_fraction=0.2, mean_clear=0.99),
-        SceneChunkStats(scene_index=1, chunk_id=1, usable_fraction=0.1, mean_clear=0.99),
+        SceneChunkStats(scene_index=0, chunk_id=1, usable_fraction=0.0, mean_clear=float("nan")),
+        SceneChunkStats(scene_index=1, chunk_id=1, usable_fraction=0.0, mean_clear=float("nan")),
     ]
 
     plan = select(
         layout=two_by_two_layout,
         stats=stats,
-        policy=SelectionPolicy(top_k=3, min_usable_fraction=0.5),
+        policy=SelectionPolicy(top_k=3),
     )
 
     assert plan.scenes_for(1) == ()
@@ -99,9 +103,12 @@ def test_invalid_policy_rejected():
     with pytest.raises(ValueError):
         SelectionPolicy(top_k=0)
     with pytest.raises(ValueError):
-        SelectionPolicy(min_usable_fraction=1.5)
-    with pytest.raises(ValueError):
         SelectionPolicy(min_clear_score=-0.1)
+
+
+def test_policy_rejects_legacy_min_usable_fraction_kwarg():
+    with pytest.raises(TypeError):
+        SelectionPolicy(min_usable_fraction=0.5)  # type: ignore[call-arg]
 
 
 def test_unknown_chunk_id_raises(two_by_two_layout):
@@ -116,3 +123,32 @@ def test_selection_plan_empty_default():
     plan = SelectionPlan(layout=layout, policy=SelectionPolicy())
     assert plan.scenes_for(0) == ()
     assert plan.scene_indices == ()
+
+
+def test_select_partitions_top_k_per_required_tile(two_by_two_layout):
+    # Chunk 0 needs both tile T and tile U. Without tile awareness, the four
+    # T-tile scenes would shut out the U-tile scene because they have higher
+    # mean_clear. With tile awareness, each required tile contributes its own
+    # top-K so chunk 0's U-side gets filled too.
+    stats = [
+        SceneChunkStats(scene_index=0, chunk_id=0, usable_fraction=1.0, mean_clear=0.99),
+        SceneChunkStats(scene_index=1, chunk_id=0, usable_fraction=1.0, mean_clear=0.95),
+        SceneChunkStats(scene_index=2, chunk_id=0, usable_fraction=1.0, mean_clear=0.90),
+        SceneChunkStats(scene_index=3, chunk_id=0, usable_fraction=1.0, mean_clear=0.85),
+        SceneChunkStats(scene_index=4, chunk_id=0, usable_fraction=1.0, mean_clear=0.40),
+    ]
+    partition = TilePartition(
+        requirements={0: ChunkTileRequirement(chunk_id=0, required_tiles=("T", "U"))},
+        scene_to_tile={0: "T", 1: "T", 2: "T", 3: "T", 4: "U"},
+        tiles=("T", "U"),
+    )
+
+    plan = select(
+        layout=two_by_two_layout,
+        stats=stats,
+        policy=SelectionPolicy(top_k=2),
+        partition=partition,
+    )
+
+    # Round-robin order: T#1, U#1, T#2 — U has only one scene so it appears once.
+    assert plan.scenes_for(0) == (0, 4, 1)

@@ -130,6 +130,43 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
+name = "bestpixel"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bytemuck",
+ "byteorder",
+ "bytes",
+ "clap",
+ "dashmap",
+ "flate2",
+ "futures",
+ "geo",
+ "geo-types",
+ "hex",
+ "libdeflater",
+ "moka",
+ "ndarray",
+ "numpy",
+ "parking_lot",
+ "proj",
+ "pyo3",
+ "rayon",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha1",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "urlencoding",
+ "wide",
+]
+
+[[package]]
 name = "bitflags"
 version = "2.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1927,43 +1964,6 @@ name = "subtle"
 version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
-
-[[package]]
-name = "surface_priors_rs"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "bytemuck",
- "byteorder",
- "bytes",
- "clap",
- "dashmap",
- "flate2",
- "futures",
- "geo",
- "geo-types",
- "hex",
- "libdeflater",
- "moka",
- "ndarray",
- "numpy",
- "parking_lot",
- "proj",
- "pyo3",
- "rayon",
- "reqwest",
- "serde",
- "serde_json",
- "sha1",
- "tempfile",
- "thiserror",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "urlencoding",
- "wide",
-]
 
 [[package]]
 name = "syn"

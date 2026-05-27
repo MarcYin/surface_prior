@@ -131,8 +131,8 @@ fn cross_crs_source_proj(
 }
 use crate::grid::GridSpec;
 use crate::pipeline::{
-    compose_best_pixel, fetch_band, fetch_quality, scout_scene, select_chunk_tile_aware,
-    select_top_k,
+    compose_best_pixel, fetch_band, fetch_quality, scenestats_from_cache, scenestats_to_cache,
+    scout_scene, select_adaptive, select_chunk_tile_aware, select_top_k, SELECT_CHUNK_SIZE,
 };
 use crate::stac::StacClient;
 use crate::tile_classification::{build_partition, chunks_from_grid, scenes_signature};
@@ -144,12 +144,16 @@ use crate::tile_classification::{build_partition, chunks_from_grid, scenes_signa
     resolution = 60.0,
     top_k = 3,
     max_cloud_cover = 90.0,
-    concurrency = 600,
+    concurrency = 192,
     endpoint = "auto".to_string(),
     disk_cache = None,
     scout_factor = 8,
     bands = None,
     output_crs = "native".to_string(),
+    coverage_target = 0.0,
+    min_k = 2,
+    max_k = 8,
+    windowed_fetch = false,
 ))]
 #[allow(clippy::too_many_arguments)]
 fn build_composite(
@@ -165,13 +169,18 @@ fn build_composite(
     scout_factor: u32,
     bands: Option<Vec<String>>,
     output_crs: String,
+    coverage_target: f32,
+    min_k: usize,
+    max_k: usize,
+    windowed_fetch: bool,
 ) -> PyResult<Bound<'_, PyDict>> {
+    let sel = SelectParams { top_k, coverage_target, min_k, max_k, windowed: windowed_fetch };
     // Release the GIL while the heavy async work runs — lets concurrent
     // Python threads do other things even though we block on tokio.
     let result = py
         .allow_threads(|| {
             run_build(
-                bbox, datetime, resolution, top_k, max_cloud_cover, concurrency, endpoint,
+                bbox, datetime, resolution, sel, max_cloud_cover, concurrency, endpoint,
                 disk_cache, scout_factor, bands, output_crs,
             )
         })
@@ -187,12 +196,16 @@ fn build_composite(
     resolution = 60.0,
     top_k = 3,
     max_cloud_cover = 90.0,
-    concurrency = 600,
+    concurrency = 192,
     endpoint = "auto".to_string(),
     disk_cache = None,
     scout_factor = 8,
     bands = None,
     output_crs = "native".to_string(),
+    coverage_target = 0.0,
+    min_k = 2,
+    max_k = 8,
+    windowed_fetch = false,
 ))]
 #[allow(clippy::too_many_arguments)]
 fn build_monthly_composites(
@@ -209,6 +222,10 @@ fn build_monthly_composites(
     scout_factor: u32,
     bands: Option<Vec<String>>,
     output_crs: String,
+    coverage_target: f32,
+    min_k: usize,
+    max_k: usize,
+    windowed_fetch: bool,
 ) -> PyResult<Bound<'_, PyList>> {
     if years.is_empty() {
         return Err(PyRuntimeError::new_err("years must be non-empty"));
@@ -223,10 +240,11 @@ fn build_monthly_composites(
             )));
         }
     }
+    let sel = SelectParams { top_k, coverage_target, min_k, max_k, windowed: windowed_fetch };
     let results = py
         .allow_threads(|| {
             run_build_periods(
-                bbox, years, months, resolution, top_k, max_cloud_cover, concurrency,
+                bbox, years, months, resolution, sel, max_cloud_cover, concurrency,
                 endpoint, disk_cache, scout_factor, bands, output_crs,
             )
         })
@@ -256,11 +274,94 @@ struct BuildResult {
     multi_tile_chunks: usize,
 }
 
+/// Scene-selection knobs threaded from the Python signature down to the
+/// per-period compositor.
+#[derive(Debug, Clone, Copy)]
+struct SelectParams {
+    /// Fixed scenes-per-chunk used when `coverage_target <= 0`.
+    top_k: usize,
+    /// Adaptive coverage target in (0,1). `<= 0` keeps the legacy fixed
+    /// `top_k` selector.
+    coverage_target: f32,
+    /// Floor on scenes per chunk under adaptive selection (best-pixel
+    /// redundancy).
+    min_k: usize,
+    /// Cap on scenes per chunk under adaptive selection.
+    max_k: usize,
+    /// Level 2: read each scene only over the window of the chunks that
+    /// requested it, instead of the full grid.
+    windowed: bool,
+}
+
+impl SelectParams {
+    fn adaptive(&self) -> bool {
+        self.coverage_target > 0.0
+    }
+}
+
+/// Pixel-space window (Level 2 windowed fetch): the bounding box, in
+/// full-grid pixels, of the chunks that selected a scene.
+#[derive(Debug, Clone, Copy)]
+struct FetchWin {
+    col0: u32,
+    row0: u32,
+    w: u32,
+    h: u32,
+}
+
+/// Bounding pixel window of a set of chunk ids (row-major
+/// `SELECT_CHUNK_SIZE` blocks over the grid).
+fn chunks_to_window(chunk_ids: &[u32], grid: &GridSpec) -> Option<FetchWin> {
+    if chunk_ids.is_empty() {
+        return None;
+    }
+    let cs = SELECT_CHUNK_SIZE;
+    let n_cols = grid.width.div_ceil(cs);
+    let (mut c0, mut r0, mut c1, mut r1) = (u32::MAX, u32::MAX, 0u32, 0u32);
+    for &cid in chunk_ids {
+        let cc = cid % n_cols;
+        let cr = cid / n_cols;
+        c0 = c0.min(cc * cs);
+        r0 = r0.min(cr * cs);
+        c1 = c1.max(((cc + 1) * cs).min(grid.width));
+        r1 = r1.max(((cr + 1) * cs).min(grid.height));
+    }
+    Some(FetchWin { col0: c0, row0: r0, w: c1 - c0, h: r1 - r0 })
+}
+
+/// A sub-grid covering `win`, pixel-aligned to `grid` (same CRS /
+/// resolution / origin offset by an integer number of pixels), so a
+/// windowed read scatters back exactly.
+fn subgrid(grid: &GridSpec, win: &FetchWin) -> GridSpec {
+    let xmin = grid.bounds[0] + win.col0 as f64 * grid.resolution;
+    let ymax = grid.bounds[3] - win.row0 as f64 * grid.resolution;
+    GridSpec {
+        bounds: [xmin, ymax - win.h as f64 * grid.resolution, xmin + win.w as f64 * grid.resolution, ymax],
+        epsg: grid.epsg,
+        proj4: grid.proj4.clone(),
+        resolution: grid.resolution,
+        width: win.w,
+        height: win.h,
+    }
+}
+
+/// Scatter a window-sized buffer into a full-grid buffer (the rest left
+/// as `fill`).
+fn scatter<T: Copy>(sub: &[T], win: &FetchWin, grid_w: usize, grid_h: usize, fill: T) -> Vec<T> {
+    let mut full = vec![fill; grid_w * grid_h];
+    let ww = win.w as usize;
+    for r in 0..win.h as usize {
+        let d0 = (win.row0 as usize + r) * grid_w + win.col0 as usize;
+        full[d0..d0 + ww].copy_from_slice(&sub[r * ww..r * ww + ww]);
+    }
+    full
+}
+
 fn run_build(
     bbox: [f64; 4],
     datetime: String,
     resolution: f64,
-    top_k: usize,
+    sel: SelectParams,
     max_cloud_cover: f64,
     concurrency: usize,
     endpoint: String,
@@ -276,6 +377,10 @@ fn run_build(
     let cpus = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(2);
+    // Cap by CPUs as a floor of safety; the request concurrency default
+    // (192) was tuned against Planetary Computer: a 5-year Egypt batch ran
+    // ~13s at 192 vs ~23s at 600 — oversubscribing the blob endpoint gives
+    // no extra throughput and trips its 429 rate-limit (→ backoff).
     let safe_concurrency = (cpus.saturating_mul(50)).max(50);
     let effective_concurrency = concurrency.min(safe_concurrency);
 
@@ -376,23 +481,7 @@ fn run_build(
                     scout_factor,
                 );
                 if let Some(cached) = c.load_scout(&key)? {
-                    let usable = cached
-                        .iter()
-                        .map(|s| s.usable_fraction)
-                        .fold(0.0_f32, |a, b| a.max(b));
-                    let mean_clear = cached
-                        .iter()
-                        .map(|s| s.mean_clear)
-                        .filter(|v| v.is_finite())
-                        .fold(f32::NAN, |a, b| if a.is_finite() { a.max(b) } else { b });
-                    stats_map.insert(
-                        item.id.clone(),
-                        crate::pipeline::SceneStats {
-                            item_id: item.id.clone(),
-                            usable_fraction: usable,
-                            mean_clear,
-                        },
-                    );
+                    stats_map.insert(item.id.clone(), scenestats_from_cache(&item.id, &cached));
                     continue;
                 }
                 to_scout.push(item.clone());
@@ -446,12 +535,7 @@ fn run_build(
                             512,
                             scout_factor,
                         );
-                        let stat = crate::pipeline::SceneChunkStat {
-                            chunk_id: 0,
-                            usable_fraction: s.usable_fraction,
-                            mean_clear: s.mean_clear,
-                        };
-                        let _ = c.store_scout(&key, &[stat]);
+                        let _ = c.store_scout(&key, &scenestats_to_cache(&s));
                     }
                     stats_map.insert(s.item_id.clone(), s);
                 }
@@ -463,8 +547,12 @@ fn run_build(
 
         // 3. tile partition + select
         let t_part = Instant::now();
-        let chunks =
-            chunks_from_grid(grid.bounds, grid.resolution, (grid.width, grid.height), 512);
+        let chunks = chunks_from_grid(
+            grid.bounds,
+            grid.resolution,
+            (grid.width, grid.height),
+            SELECT_CHUNK_SIZE,
+        );
         let scene_geoms: Vec<(usize, String, serde_json::Value)> = items
             .iter()
             .enumerate()
@@ -478,11 +566,47 @@ fn run_build(
             1,
             (grid.resolution * grid.resolution) as f64,
         )?;
-        let picks = if let Some(p) = &partition {
-            select_chunk_tile_aware(&items, &stats_map, p, top_k)
-        } else {
-            select_top_k(&items, &stats_map, top_k)
-        };
+        let (scenes_for_fetch, windows): (Vec<crate::stac::StacItem>, Vec<Option<FetchWin>>) =
+            if sel.adaptive() {
+                select_adaptive(
+                    &items,
+                    &stats_map,
+                    partition.as_ref(),
+                    chunks.len(),
+                    sel.coverage_target,
+                    sel.min_k,
+                    sel.max_k,
+                )
+                .into_iter()
+                .map(|p| {
+                    // Level 2: read each scene only over the bounding window of
+                    // the chunks that selected it. Level 1 (windowed=false) reads
+                    // the full grid for every pick.
+                    let win = if sel.windowed { chunks_to_window(&p.chunk_ids, &grid) } else { None };
+                    (p.scene.clone(), win)
+                })
+                .unzip()
+            } else {
+                let picks = if let Some(p) = &partition {
+                    select_chunk_tile_aware(&items, &stats_map, p, sel.top_k)
+                } else {
+                    select_top_k(&items, &stats_map, sel.top_k)
+                };
+                picks.iter().map(|p| (p.scene.clone(), None)).unzip()
+            };
+        // Per-scene read grid: the sub-window when windowed, else the full grid.
+        let scene_grids: Vec<GridSpec> = windows
+            .iter()
+            .map(|w| w.map(|win| subgrid(&grid, &win)).unwrap_or_else(|| grid.clone()))
+            .collect();
+        // Deterministic proxy for fetch volume: total source pixels read across
+        // scenes (bytes ∝ this × bands). Windowed reads shrink it for the
+        // marginal scenes that only a few chunks requested.
+        let read_megapixels: f64 = scene_grids
+            .iter()
+            .map(|g| g.width as f64 * g.height as f64)
+            .sum::<f64>()
+            / 1e6;
         timings.insert("partition".to_string(), t_part.elapsed().as_secs_f64());
 
         // 4. fetch
@@ -515,10 +639,9 @@ fn run_build(
                 .map(|s| (*s).to_string())
                 .collect()
         };
-        let scenes_for_fetch: Vec<crate::stac::StacItem> =
-            picks.iter().map(|p| p.scene.clone()).collect();
         let mut band_tasks = FuturesUnordered::new();
         for (scene_idx, scene) in scenes_for_fetch.iter().enumerate() {
+            let read_grid = scene_grids[scene_idx].clone();
             for (band_idx, band_name) in band_names_out.iter().enumerate() {
                 // Per-scene asset resolution: HLS L30 and S30 use the
                 // same stable band name but different asset keys.
@@ -534,7 +657,7 @@ fn run_build(
                 let asset = asset.to_string();
                 let scene = scene.clone();
                 let http = http.clone();
-                let grid = grid.clone();
+                let grid = read_grid.clone();
                 let sem = request_semaphore.clone();
                 band_tasks.push(tokio::spawn(async move {
                     let res = fetch_band(
@@ -562,7 +685,7 @@ fn run_build(
             let quality_asset = quality_asset.to_string();
             let scene = scene.clone();
             let http = http.clone();
-            let grid = grid.clone();
+            let grid = read_grid.clone();
             let sem = request_semaphore.clone();
             band_tasks.push(tokio::spawn(async move {
                 let res = fetch_quality(
@@ -598,6 +721,8 @@ fn run_build(
                 Err(e) => eprintln!("fetch task panic: {e}"),
             }
         }
+        let (grid_w, grid_h) = (grid.width as usize, grid.height as usize);
+        let nodata_fill = quality_kind.nodata_fill();
         let mut observations: Vec<(String, Vec<Vec<u16>>, Vec<u8>)> = Vec::new();
         for (idx, scene) in scenes_for_fetch.iter().enumerate() {
             let quality = match quality_by_scene[idx].take() {
@@ -618,9 +743,23 @@ fn run_build(
             if !ok {
                 continue;
             }
-            observations.push((scene.id.clone(), bands_data, quality));
+            // Windowed reads come back sized to the sub-window — scatter them
+            // into full-grid buffers (bands padded with 0, quality with a
+            // nodata byte so compose ignores the padding) so compose_best_pixel
+            // sees uniform full-grid observations.
+            if let Some(win) = windows[idx] {
+                bands_data = bands_data
+                    .into_iter()
+                    .map(|b| scatter(&b, &win, grid_w, grid_h, 0u16))
+                    .collect();
+                let quality = scatter(&quality, &win, grid_w, grid_h, nodata_fill);
+                observations.push((scene.id.clone(), bands_data, quality));
+            } else {
+                observations.push((scene.id.clone(), bands_data, quality));
+            }
         }
         timings.insert("fetch".to_string(), t.elapsed().as_secs_f64());
+        timings.insert("read_megapixels".to_string(), read_megapixels);
 
         // 5. compose
         let t = Instant::now();
@@ -672,7 +811,7 @@ fn run_build_periods(
     years: Vec<u32>,
     months: Vec<u32>,
     resolution: f64,
-    top_k: usize,
+    sel: SelectParams,
     max_cloud_cover: f64,
     concurrency: usize,
     endpoint: String,
@@ -688,6 +827,10 @@ fn run_build_periods(
     let cpus = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(2);
+    // Cap by CPUs as a floor of safety; the request concurrency default
+    // (192) was tuned against Planetary Computer: a 5-year Egypt batch ran
+    // ~13s at 192 vs ~23s at 600 — oversubscribing the blob endpoint gives
+    // no extra throughput and trips its 429 rate-limit (→ backoff).
     let safe_concurrency = (cpus.saturating_mul(50)).max(50);
     let effective_concurrency = concurrency.min(safe_concurrency);
 
@@ -702,15 +845,6 @@ fn run_build_periods(
         .iter()
         .flat_map(|y| months_sorted.iter().map(move |m| (*y, *m)))
         .collect();
-    let min_year = *years_sorted.first().unwrap();
-    let max_year = *years_sorted.last().unwrap();
-    let min_month = *months_sorted.first().unwrap();
-    let max_month = *months_sorted.last().unwrap();
-    // STAC handles "yyyy-mm-31" gracefully even for Feb — extra day yields
-    // zero items. Avoids dealing with leap years and DST nonsense.
-    let full_datetime = format!(
-        "{min_year:04}-{min_month:02}-01/{max_year:04}-{max_month:02}-31"
-    );
 
     let rt = shared_runtime();
     rt.block_on(async move {
@@ -737,34 +871,75 @@ fn run_build_periods(
             None
         };
 
-        // 1. ONE STAC search across the union datetime range.
+        // 1. One STAC search per requested (year, month), run concurrently.
+        //
+        // A single search over the contiguous min..max range pages through
+        // every gap month between the requested ones — July-only across 5
+        // years scans ~48 months of scenes (hundreds of items, many pages),
+        // which measured ~11s and dominated the wall. Searching each period
+        // separately pages only the months we actually compose; running the
+        // searches concurrently keeps total latency to roughly one search.
+        // The disk cache keys each search on its own per-period datetime, so
+        // warm runs reuse them. (For contiguous month ranges this is a few
+        // more searches than one union query, but each is small and they
+        // overlap, so the wall is unchanged — and gap months are never
+        // scanned.)
         let t = Instant::now();
-        let stac = StacClient::new(
-            &endpoint.stac_url,
-            endpoint.collections.clone(),
-            bbox,
-            full_datetime.clone(),
-            cloud_cover_filter,
-        )?;
-        let raw_items = if let Some(c) = &cache {
-            let key = c.search_key(
-                &endpoint.stac_url,
-                &collections_key,
-                bbox,
-                &full_datetime,
-                cloud_cover_filter,
-            );
-            match c.load_search(&key)? {
-                Some(items) => items,
-                None => {
+        // STAC tolerates "yyyy-mm-31" for short months (extra days yield no
+        // items), so we avoid leap-year/last-day arithmetic.
+        let period_datetimes: Vec<String> = periods
+            .iter()
+            .map(|(y, m)| format!("{y:04}-{m:02}-01/{y:04}-{m:02}-31"))
+            .collect();
+        let search_futs = period_datetimes.iter().map(|dt| {
+            let endpoint = &endpoint;
+            let cache = &cache;
+            let collections_key = &collections_key;
+            async move {
+                let stac = StacClient::new(
+                    &endpoint.stac_url,
+                    endpoint.collections.clone(),
+                    bbox,
+                    dt.clone(),
+                    cloud_cover_filter,
+                )?;
+                if let Some(c) = cache {
+                    let key = c.search_key(
+                        &endpoint.stac_url,
+                        collections_key,
+                        bbox,
+                        dt,
+                        cloud_cover_filter,
+                    );
+                    if let Some(items) = c.load_search(&key)? {
+                        return Ok::<Vec<serde_json::Value>, anyhow::Error>(items);
+                    }
                     let fresh = stac.search_raw().await.context("STAC search")?;
                     c.store_search(&key, &fresh)?;
-                    fresh
+                    Ok(fresh)
+                } else {
+                    Ok(stac.search_raw().await.context("STAC search")?)
                 }
             }
-        } else {
-            stac.search_raw().await.context("STAC search")?
-        };
+        });
+        let per_period_raw = futures::future::try_join_all(search_futs).await?;
+        // Flatten; dedup by item id (a scene belongs to exactly one month,
+        // so collisions are unlikely, but be defensive).
+        let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut raw_items: Vec<serde_json::Value> = Vec::new();
+        for batch in per_period_raw {
+            for it in batch {
+                match it.get("id").and_then(|v| v.as_str()) {
+                    Some(id) => {
+                        if seen_ids.insert(id.to_string()) {
+                            raw_items.push(it);
+                        }
+                    }
+                    None => raw_items.push(it),
+                }
+            }
+        }
+
         let signed_items: Vec<serde_json::Value> = {
             let mut signed = Vec::with_capacity(raw_items.len());
             for raw in raw_items {
@@ -795,23 +970,7 @@ fn run_build_periods(
                     scout_factor,
                 );
                 if let Some(cached) = c.load_scout(&key)? {
-                    let usable = cached
-                        .iter()
-                        .map(|s| s.usable_fraction)
-                        .fold(0.0_f32, |a, b| a.max(b));
-                    let mean_clear = cached
-                        .iter()
-                        .map(|s| s.mean_clear)
-                        .filter(|v| v.is_finite())
-                        .fold(f32::NAN, |a, b| if a.is_finite() { a.max(b) } else { b });
-                    stats_map.insert(
-                        item.id.clone(),
-                        crate::pipeline::SceneStats {
-                            item_id: item.id.clone(),
-                            usable_fraction: usable,
-                            mean_clear,
-                        },
-                    );
+                    stats_map.insert(item.id.clone(), scenestats_from_cache(&item.id, &cached));
                     continue;
                 }
                 to_scout.push(item.clone());
@@ -856,12 +1015,7 @@ fn run_build_periods(
                             512,
                             scout_factor,
                         );
-                        let stat = crate::pipeline::SceneChunkStat {
-                            chunk_id: 0,
-                            usable_fraction: s.usable_fraction,
-                            mean_clear: s.mean_clear,
-                        };
-                        let _ = c.store_scout(&key, &[stat]);
+                        let _ = c.store_scout(&key, &scenestats_to_cache(&s));
                     }
                     stats_map.insert(s.item_id.clone(), s);
                 }
@@ -897,53 +1051,44 @@ fn run_build_periods(
                 .collect()
         };
 
-        // 3. Compose per (year, month). Each period's fetch is
-        // independent; spawn them concurrently and let the shared
-        // connection pool / semaphore arbitrate. Periods that share
-        // tiles benefit from the OS page cache + reqwest connection
-        // reuse without any explicit sharing in our code.
-        let endpoint_arc = endpoint.clone();
-        let http_arc = http.clone();
-        let sem_arc = request_semaphore.clone();
+        // 3. Compose per (year, month) SEQUENTIALLY.
+        //
+        // compose_one_period already fans every (scene × band) fetch out
+        // across the shared semaphore and connection pool, which saturates
+        // the link on its own. Running multiple periods concurrently only
+        // oversubscribes it: in-flight requests climb past the idle-pool
+        // size (forcing fresh TCP+TLS handshakes) and contend for bandwidth,
+        // dropping aggregate throughput *below* the sequential case
+        // (measured ~23.7s concurrent vs ~15.9s sequential for a 5-period
+        // Nile Delta batch against PC, and per-period fetch inflated ~2.5s
+        // → ~7.5s). The batch win is the shared (concurrent) searches +
+        // single scout pass above — not period-level fetch parallelism. Each
+        // period also reuses the now-warm connection pool left by the
+        // previous one.
         let band_names_arc = Arc::new(band_names_out);
         let items_arc = Arc::new(items);
         let stats_arc = Arc::new(stats_map);
 
-        let mut period_tasks = Vec::with_capacity(periods.len());
-        for (year, month) in periods {
-            let endpoint = endpoint_arc.clone();
-            let http = http_arc.clone();
-            let sem = sem_arc.clone();
-            let band_names = band_names_arc.clone();
-            let items = items_arc.clone();
-            let stats = stats_arc.clone();
-            let grid = grid.clone();
-            period_tasks.push(tokio::spawn(async move {
-                compose_one_period(
-                    year,
-                    month,
-                    items.as_ref(),
-                    stats.as_ref(),
-                    &grid,
-                    endpoint.as_ref(),
-                    http,
-                    sem,
-                    band_names.as_ref(),
-                    top_k,
-                    source_proj_for_fetch,
-                )
-                .await
-                .map(|build| PeriodResult { year, month, build })
-            }));
-        }
-
-        let mut results: Vec<PeriodResult> = Vec::with_capacity(period_tasks.len());
+        let mut results: Vec<PeriodResult> = Vec::with_capacity(periods.len());
         let mut errs: Vec<String> = Vec::new();
-        for task in period_tasks {
-            match task.await {
-                Ok(Ok(r)) => results.push(r),
-                Ok(Err(e)) => errs.push(format!("period err: {e:#}")),
-                Err(e) => errs.push(format!("period panic: {e}")),
+        for (year, month) in periods {
+            match compose_one_period(
+                year,
+                month,
+                items_arc.as_ref(),
+                stats_arc.as_ref(),
+                &grid,
+                endpoint.as_ref(),
+                http.clone(),
+                request_semaphore.clone(),
+                band_names_arc.as_ref(),
+                sel,
+                source_proj_for_fetch,
+            )
+            .await
+            {
+                Ok(build) => results.push(PeriodResult { year, month, build }),
+                Err(e) => errs.push(format!("period {year:04}-{month:02} err: {e:#}")),
             }
         }
         if results.is_empty() && !errs.is_empty() {
@@ -951,6 +1096,17 @@ fn run_build_periods(
         }
         // Sort by (year, month) for stable output ordering.
         results.sort_by_key(|r| (r.year, r.month));
+
+        // Surface the shared (amortized-once) phase costs on every period,
+        // mirroring what build_composite returns per call. These are not
+        // per-period — they're the single search + single scout shared
+        // across the whole batch.
+        for r in results.iter_mut() {
+            r.build
+                .timings
+                .insert("shared_list_scenes".to_string(), dt_list);
+            r.build.timings.insert("shared_scout".to_string(), dt_scout);
+        }
 
         tracing::info!(
             list_scenes = dt_list,
@@ -976,7 +1132,7 @@ async fn compose_one_period(
     http: Arc<reqwest::Client>,
     sem: Arc<tokio::sync::Semaphore>,
     band_names_out: &[String],
-    top_k: usize,
+    sel: SelectParams,
     source_proj: Option<&'static str>,
 ) -> anyhow::Result<BuildResult> {
     use futures::stream::{FuturesUnordered, StreamExt};
@@ -992,8 +1148,11 @@ async fn compose_one_period(
         .cloned()
         .collect();
 
-    // Partition + select (same as run_build).
-    let chunks = chunks_from_grid(grid.bounds, grid.resolution, (grid.width, grid.height), 512);
+    // Select scenes. Adaptive path uses per-chunk scout coverage to spend
+    // depth only where it's needed; the legacy path takes a fixed top_k per
+    // required tile.
+    let chunks =
+        chunks_from_grid(grid.bounds, grid.resolution, (grid.width, grid.height), SELECT_CHUNK_SIZE);
     let scene_geoms: Vec<(usize, String, serde_json::Value)> = period_items
         .iter()
         .enumerate()
@@ -1007,19 +1166,53 @@ async fn compose_one_period(
         1,
         (grid.resolution * grid.resolution) as f64,
     )?;
-    let picks = if let Some(p) = &partition {
-        select_chunk_tile_aware(&period_items, stats, p, top_k)
-    } else {
-        select_top_k(&period_items, stats, top_k)
-    };
+    // `windows[i]` is the pixel sub-window to read scene `i` over (Level 2
+    // windowed fetch); `None` = read the full grid (Level 1 / legacy).
+    let (scenes_for_fetch, windows): (Vec<crate::stac::StacItem>, Vec<Option<FetchWin>>) =
+        if sel.adaptive() {
+            select_adaptive(
+                &period_items,
+                stats,
+                partition.as_ref(),
+                chunks.len(),
+                sel.coverage_target,
+                sel.min_k,
+                sel.max_k,
+            )
+            .into_iter()
+            .map(|p| {
+                let win = if sel.windowed { chunks_to_window(&p.chunk_ids, grid) } else { None };
+                (p.scene.clone(), win)
+            })
+            .unzip()
+        } else {
+            let picks = if let Some(p) = &partition {
+                select_chunk_tile_aware(&period_items, stats, p, sel.top_k)
+            } else {
+                select_top_k(&period_items, stats, sel.top_k)
+            };
+            picks.iter().map(|p| (p.scene.clone(), None)).unzip()
+        };
+    // Per-scene read grid: the sub-window when windowed, else the full grid.
+    let scene_grids: Vec<GridSpec> = windows
+        .iter()
+        .map(|w| w.map(|win| subgrid(grid, &win)).unwrap_or_else(|| grid.clone()))
+        .collect();
+    // Deterministic proxy for fetch volume: total source pixels read across
+    // scenes (bytes ∝ this × bands). Windowed reads shrink it for the
+    // marginal scenes that only a few chunks requested.
+    let read_megapixels: f64 = scene_grids
+        .iter()
+        .map(|g| g.width as f64 * g.height as f64)
+        .sum::<f64>()
+        / 1e6;
 
     // Fetch + compose, mirroring run_build's loop.
     let t = Instant::now();
     let quality_kind = endpoint.quality_kind;
-    let scenes_for_fetch: Vec<crate::stac::StacItem> =
-        picks.iter().map(|p| p.scene.clone()).collect();
     let mut band_tasks = FuturesUnordered::new();
     for (scene_idx, scene) in scenes_for_fetch.iter().enumerate() {
+        let read_grid = scene_grids[scene_idx].clone();
         for (band_idx, band_name) in band_names_out.iter().enumerate() {
             let Some(asset) = endpoint.asset_for(&scene.collection, band_name) else {
                 continue;
@@ -1027,7 +1220,7 @@ async fn compose_one_period(
             let asset = asset.to_string();
             let scene = scene.clone();
             let http = http.clone();
-            let grid = grid.clone();
+            let grid = read_grid.clone();
             let sem = sem.clone();
             band_tasks.push(tokio::spawn(async move {
                 let res =
@@ -1043,7 +1236,7 @@ async fn compose_one_period(
         let quality_asset = quality_asset.to_string();
         let scene = scene.clone();
         let http = http.clone();
-        let grid = grid.clone();
+        let grid = read_grid.clone();
         let sem = sem.clone();
         band_tasks.push(tokio::spawn(async move {
             let res = fetch_quality(
@@ -1079,6 +1272,8 @@ async fn compose_one_period(
             Err(e) => eprintln!("fetch task panic: {e}"),
         }
     }
+    let (grid_w, grid_h) = (grid.width as usize, grid.height as usize);
+    let nodata_fill = quality_kind.nodata_fill();
     let mut observations: Vec<(String, Vec<Vec<u16>>, Vec<u8>)> = Vec::new();
     for (idx, scene) in scenes_for_fetch.iter().enumerate() {
         let quality = match quality_by_scene[idx].take() {
@@ -1099,9 +1294,23 @@ async fn compose_one_period(
         if !ok {
             continue;
         }
-        observations.push((scene.id.clone(), bands_data, quality));
+        // Windowed reads come back sized to the sub-window — scatter them
+        // into full-grid buffers (bands padded with 0, quality with a
+        // nodata byte so compose ignores the padding) so compose_best_pixel
+        // sees uniform full-grid observations.
+        if let Some(win) = windows[idx] {
+            bands_data = bands_data
+                .into_iter()
+                .map(|b| scatter(&b, &win, grid_w, grid_h, 0u16))
+                .collect();
+            let quality = scatter(&quality, &win, grid_w, grid_h, nodata_fill);
+            observations.push((scene.id.clone(), bands_data, quality));
+        } else {
+            observations.push((scene.id.clone(), bands_data, quality));
+        }
     }
     timings.insert("fetch".to_string(), t.elapsed().as_secs_f64());
+    timings.insert("read_megapixels".to_string(), read_megapixels);
 
     let t = Instant::now();
     let composite =
@@ -1219,7 +1428,14 @@ fn encode_period_results(
 }
 
 #[pymodule]
-fn surface_priors_rs(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn bestpixel(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+    // Opt-in tracing to stderr when RUST_LOG is set (e.g.
+    // RUST_LOG=bestpixel=debug surfaces fetch_band's per-fetch
+    // open/read/stitch/resample timings and tile counts). No-op otherwise.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_writer(std::io::stderr)
+        .try_init();
     m.add_function(wrap_pyfunction!(build_composite, m)?)?;
     m.add_function(wrap_pyfunction!(build_monthly_composites, m)?)?;
     Ok(())

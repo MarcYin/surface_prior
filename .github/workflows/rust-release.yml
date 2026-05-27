@@ -22,12 +22,23 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Primary target: portable manylinux_2_28 x86_64. Requires
-          # AVX2/FMA at runtime (Haswell+ / Zen+) because the resampler
-          # uses hand-rolled AVX2 intrinsics in the hot path.
+          # x86_64 keeps the AVX2/FMA hot path (x86-64-v3 baseline);
+          # ARM targets compile the scalar resampler fallback
+          # (grid.rs gates AVX2 behind cfg(target_arch = "x86_64")).
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
             manylinux: "2_28"
+            rustflags: "-C target-cpu=x86-64-v3"
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-latest
+            manylinux: "2_28"
+            rustflags: "-C target-cpu=generic"
+          - target: aarch64-apple-darwin
+            runner: macos-14
+            rustflags: "-C target-cpu=apple-m1"
+          - target: x86_64-apple-darwin
+            runner: macos-13
+            rustflags: "-C target-cpu=x86-64-v3"
     steps:
       - uses: actions/checkout@v4
 
@@ -35,8 +46,19 @@ jobs:
         with:
           python-version: "3.12"
 
-      # PROJ is needed by proj-sys; install inside the manylinux build
-      # container before maturin runs cargo.
+      # aarch64 linux wheel cross-builds in an emulated manylinux container.
+      - name: Set up QEMU (aarch64 linux)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        uses: docker/setup-qemu-action@v3
+
+      # macOS: PROJ via Homebrew (Linux installs it inside the manylinux
+      # container in before-script-linux below); maturin bundles the dylib.
+      - name: Install PROJ (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install proj pkg-config
+          echo "PKG_CONFIG_PATH=$(brew --prefix)/lib/pkgconfig" >> "$GITHUB_ENV"
+
       - name: Build wheel
         uses: PyO3/maturin-action@v1
         env:
@@ -56,9 +78,9 @@ jobs:
             dnf install -y epel-release
             dnf install -y proj-devel sqlite-devel clang
           rust-toolchain: stable
-          # Override .cargo/config.toml `target-cpu=native` with a
-          # portable baseline that still keeps AVX2/FMA in the hot path.
-          rustflags: "-C target-cpu=x86-64-v3"
+          # Override .cargo/config.toml `target-cpu=native` per-arch so the
+          # wheel is portable (auditwheel/delocate bundle libproj).
+          rustflags: ${{ matrix.rustflags }}
 
       - name: Upload wheel artifact
         uses: actions/upload-artifact@v4
@@ -107,3 +129,22 @@ jobs:
           name: ${{ github.event.inputs.tag || github.ref_name }}
           generate_release_notes: true
           files: dist/*
+
+  pypi:
+    name: Publish to PyPI (trusted publishing)
+    needs: [build, sdist]
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write  # OIDC for PyPI trusted publishing — no API token
+    steps:
+      - name: Collect wheels + sdist
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - run: ls -la dist
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist

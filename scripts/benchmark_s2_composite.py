@@ -150,7 +150,6 @@ def run_real(
     fetch_workers: int,
     cache_dir: Path,
     top_k: int,
-    min_usable_fraction: float,
     scout_workers: int,
     band_workers: int,
 ) -> PhaseTimings:
@@ -164,10 +163,7 @@ def run_real(
         cache_dir=cache_dir,
         source=source,
         chunk_size=chunk_size,
-        selection_policy=SelectionPolicy(
-            top_k=top_k,
-            min_usable_fraction=min_usable_fraction,
-        ),
+        selection_policy=SelectionPolicy(top_k=top_k),
         fetch_workers=fetch_workers,
     )
     provider = Provider(config)
@@ -315,7 +311,7 @@ def run_synthetic(
     plan = select(
         layout=layout,
         stats=stats,
-        policy=SelectionPolicy(top_k=top_k, min_usable_fraction=0.5),
+        policy=SelectionPolicy(top_k=top_k),
     )
     timings.select = time.perf_counter() - t2
     timings.n_selected_pairs = sum(len(s) for s in plan.selected.values())
@@ -379,7 +375,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--resolution", type=float, default=20.0)
     parser.add_argument("--chunk-size", type=int, default=512)
     parser.add_argument("--top-k", type=int, default=3)
-    parser.add_argument("--min-usable-fraction", type=float, default=0.5)
     parser.add_argument("--fetch-workers", type=int, default=8)
     parser.add_argument("--scout-workers", type=int, default=16)
     parser.add_argument("--band-workers", type=int, default=12)
@@ -408,7 +403,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             fetch_workers=args.fetch_workers,
             cache_dir=args.cache_dir,
             top_k=args.top_k,
-            min_usable_fraction=args.min_usable_fraction,
             scout_workers=args.scout_workers,
             band_workers=args.band_workers,
         )

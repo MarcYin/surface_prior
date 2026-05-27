@@ -252,7 +252,7 @@ def test_provider_runs_stac_source_end_to_end(scene_geotiffs, tmp_path):
             cache_dir=tmp_path / "cache",
             source=source,
             chunk_size=2,
-            selection_policy=SelectionPolicy(top_k=1, min_usable_fraction=0.5),
+            selection_policy=SelectionPolicy(top_k=1),
             fetch_workers=1,
         )
     )
