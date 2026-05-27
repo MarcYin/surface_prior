@@ -1,8 +1,9 @@
-# surface-priors-rs
+# bestpixel
 
-Production Rust port of the surface-priors monthly composite pipeline,
-with optional Python bindings that return numpy arrays directly (no
-GeoTIFF writes). Supports four STAC sources out of the box:
+Fast, Rust-backed **best-pixel cloud-free composites** straight from
+STAC/COG sources — give it a bbox + date range, get cloud-free multiband
+reflectance as numpy arrays (no downloads, no GeoTIFF writes). Supports
+four STAC sources out of the box:
 
 | Endpoint | Collection(s) | Bands | Quality mask | Output CRS |
 |---|---|---|---|---|
@@ -35,45 +36,59 @@ Computer, on a single 16-core Zen 4 node:
 
 The 5-way parallel floor is set by network throughput to PC, not CPU.
 
-## Python support
-
-Built as an [abi3](https://docs.python.org/3/c-api/stable.html) wheel
-against the Python 3.9 stable ABI, so a single wheel installs and
-runs on CPython 3.9, 3.10, 3.11, 3.12, 3.13, and 3.14.
-
-## Use from Python
-
-Install from a prebuilt wheel (attached to GitHub Releases):
+## Install
 
 ```bash
-pip install <wheel-url-from-release>
+pip install bestpixel
 ```
 
-Or build locally with maturin:
+A single [abi3](https://docs.python.org/3/c-api/stable.html) wheel runs on
+CPython 3.9–3.14. Or build locally with maturin:
 
 ```bash
 pip install maturin
-cd surface_priors_rs
+cd surface_priors_rs        # the crate directory
 maturin develop --release --features python
 ```
 
-Then:
+## Use from Python
 
 ```python
-import surface_priors_rs as spx
+import bestpixel as spx
 
 out = spx.build_composite(
     bbox=(30.5, 30.5, 31.6, 31.5),         # west, south, east, north (WGS84)
     datetime="2024-07-01/2024-07-31",      # STAC datetime range
     resolution=60.0,                        # metres
-    top_k=3,                                # observations per chunk
-    endpoint="pc",                          # "pc" | "earth-search" | "auto"
+    endpoint="pc",                          # "pc" | "earth-search" | "hls" | "mcd43a4" | "auto"
     bands=["coastal", "blue", "green", "red", "nir", "swir16", "swir22"],
 )
 
 red = out["bands"]["red"]                   # uint16 ndarray, (H, W)
 quality = out["quality"]                    # uint16, 0=clear, 1=marginal, 2=dark, 65535=nodata
 print(out["grid"])                          # bounds, epsg, transform — for georeferencing
+```
+
+Values are int16 DN; **reflectance = DN / 10000** (the Sentinel-2 N0400
+`+1000` BOA offset is harmonized internally so all years are comparable).
+
+### Scene selection
+
+By default each chunk takes a fixed `top_k` clearest observations. For
+**adaptive depth**, set `coverage_target` in `(0, 1)`: the scout's coarse
+per-chunk cloud masks drive how many scenes each chunk stacks — cloudy
+chunks pull more, clear chunks stop early — with a `min_k` redundancy
+floor and `max_k` cap. Add `windowed_fetch=True` to read each scene only
+over the chunks that need it (far fewer bytes when depth is concentrated,
+e.g. an under-observed swath-edge corner):
+
+```python
+out = spx.build_composite(
+    bbox=(30.5, 30.5, 31.6, 31.5),
+    datetime="2024-07-01/2024-07-31",
+    coverage_target=0.95, min_k=2, max_k=6,   # adaptive per-chunk depth
+    windowed_fetch=True,                       # read only the windows that need depth
+)
 ```
 
 Available band names (stable across endpoints):

@@ -6,15 +6,15 @@
 //! verification script in CI, not here.
 
 use std::collections::HashMap;
-use surface_priors_rs::endpoint::QualityKind;
-use surface_priors_rs::grid::GridSpec;
-use surface_priors_rs::pipeline::{
+use bestpixel::endpoint::QualityKind;
+use bestpixel::grid::GridSpec;
+use bestpixel::pipeline::{
     per_chunk_clear, per_chunk_masks, s2_boa_offset, select_adaptive, ChunkMask, SceneStats,
     CHUNK_MASK_DIM,
 };
-use surface_priors_rs::projx;
-use surface_priors_rs::stac::StacItem;
-use surface_priors_rs::tile_classification::{build_partition, chunks_from_grid};
+use bestpixel::projx;
+use bestpixel::stac::StacItem;
+use bestpixel::tile_classification::{build_partition, chunks_from_grid};
 
 #[test]
 fn grid_from_wgs84_matches_python_snapped_bounds() {
@@ -281,7 +281,7 @@ fn adaptive_covers_each_tile_on_a_seam_chunk() {
     // per required tile, so all four scenes are selected (both halves get
     // redundancy) — the fix for the Level-2 seam under-coverage.
     use std::collections::BTreeMap;
-    use surface_priors_rs::tile_classification::{ChunkTileRequirement, TilePartition};
+    use bestpixel::tile_classification::{ChunkTileRequirement, TilePartition};
 
     let half = MASK_CELLS / 2;
     let scenes = vec![

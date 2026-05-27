@@ -19,8 +19,8 @@ import argparse
 import sys
 import time
 
+import bestpixel as spx
 import numpy as np
-import surface_priors_rs as spx
 
 BBOX = (30.5, 30.5, 31.6, 31.5)  # Nile Delta, WGS84
 RESOLUTION = 60.0

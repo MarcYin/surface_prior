@@ -1,12 +1,12 @@
-"""Smoke-test the surface_priors_rs Python module.
+"""Smoke-test the bestpixel Python module.
 
 Runs a tiny single-month composite at 60 m and checks that we get
 back numpy arrays with the expected dtype/shape — no GeoTIFF writes.
 """
 import time
 
+import bestpixel as spx
 import numpy as np
-import surface_priors_rs as spx
 
 # Nile Delta AOI used across the CLI benchmarks — spans multiple MGRS
 # tiles, so this exercises the tile-aware selector + multi-source

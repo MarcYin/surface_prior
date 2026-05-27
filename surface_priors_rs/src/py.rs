@@ -1428,9 +1428,9 @@ fn encode_period_results(
 }
 
 #[pymodule]
-fn surface_priors_rs(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn bestpixel(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Opt-in tracing to stderr when RUST_LOG is set (e.g.
-    // RUST_LOG=surface_priors_rs=debug surfaces fetch_band's per-fetch
+    // RUST_LOG=bestpixel=debug surfaces fetch_band's per-fetch
     // open/read/stitch/resample timings and tile counts). No-op otherwise.
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())

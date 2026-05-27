@@ -1,7 +1,7 @@
 """Smoke-test the new multi-month/multi-year API."""
 import time
 
-import surface_priors_rs as spx
+import bestpixel as spx
 
 print("=== JJA 2018-2020 (9 periods) ===")
 t0 = time.time()

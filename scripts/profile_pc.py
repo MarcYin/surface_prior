@@ -2,7 +2,7 @@
 import shutil
 import time
 
-import surface_priors_rs as spx
+import bestpixel as spx
 
 CACHE = "/tmp/spx-profile-pc"
 

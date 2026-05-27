@@ -1,7 +1,7 @@
 """Smoke-test MCD43A4 with output_crs="utm" — reproject sinusoidal → UTM on the fly."""
 import time
 
-import surface_priors_rs as spx
+import bestpixel as spx
 
 BBOX = (30.5, 30.5, 31.6, 31.5)
 

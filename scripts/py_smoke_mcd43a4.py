@@ -5,8 +5,8 @@ proj4 instead of a real EPSG.
 """
 import time
 
+import bestpixel as spx
 import numpy as np
-import surface_priors_rs as spx
 
 t0 = time.time()
 out = spx.build_composite(

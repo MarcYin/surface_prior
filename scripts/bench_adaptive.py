@@ -31,8 +31,8 @@ CONFIGS = {
 
 
 def run_one(name: str) -> dict:
+    import bestpixel as spx
     import numpy as np
-    import surface_priors_rs as spx
     cache = f"/tmp/bench-adapt-{name.replace('=', '').replace('+', '-')}"
     shutil.rmtree(cache, ignore_errors=True)
     t0 = time.time()

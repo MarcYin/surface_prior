@@ -9,14 +9,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-use surface_priors_rs::disk_cache::{grid_signature, DiskCache};
-use surface_priors_rs::endpoint::{auto_pick, EndpointConfig, EndpointKind};
-use surface_priors_rs::grid::GridSpec;
-use surface_priors_rs::pipeline::{
+use bestpixel::disk_cache::{grid_signature, DiskCache};
+use bestpixel::endpoint::{auto_pick, EndpointConfig, EndpointKind};
+use bestpixel::grid::GridSpec;
+use bestpixel::pipeline::{
     compose_best_pixel, fetch_band, fetch_quality, scout_scene, select_chunk_tile_aware,
     select_top_k, Timing,
 };
-use surface_priors_rs::stac::StacClient;
+use bestpixel::stac::StacClient;
 
 #[derive(Parser, Debug)]
 #[command(about = "End-to-end S2 L2A monthly composite — Rust port.")]
@@ -170,7 +170,7 @@ async fn async_main() -> Result<()> {
     let request_semaphore = Arc::new(tokio::sync::Semaphore::new(effective_concurrency.max(1)));
 
     let cache = cli.disk_cache.as_ref().map(|p| DiskCache::new(p));
-    surface_priors_rs::cog::set_cog_disk_cache(cache.clone());
+    bestpixel::cog::set_cog_disk_cache(cache.clone());
     let _grid_sig = grid_signature(grid.bounds, grid.epsg, grid.resolution, grid.width, grid.height);
 
     // --- List scenes -------------------------------------------------------
@@ -232,8 +232,8 @@ async fn async_main() -> Result<()> {
     // the same year hits the cache for every scouted scene.
     let t = Instant::now();
     let coarse_resolution = cli.resolution * cli.scout_factor as f64;
-    let mut stats_map: HashMap<String, surface_priors_rs::pipeline::SceneStats> = HashMap::new();
-    let mut to_scout: Vec<surface_priors_rs::stac::StacItem> = Vec::new();
+    let mut stats_map: HashMap<String, bestpixel::pipeline::SceneStats> = HashMap::new();
+    let mut to_scout: Vec<bestpixel::stac::StacItem> = Vec::new();
     if let Some(c) = &cache {
         let gsig = grid_signature(grid.bounds, grid.epsg, grid.resolution, grid.width, grid.height);
         for item in &items {
@@ -248,7 +248,7 @@ async fn async_main() -> Result<()> {
             if let Some(cached) = c.load_scout(&key)? {
                 stats_map.insert(
                     item.id.clone(),
-                    surface_priors_rs::pipeline::scenestats_from_cache(&item.id, &cached),
+                    bestpixel::pipeline::scenestats_from_cache(&item.id, &cached),
                 );
                 continue;
             }
@@ -303,7 +303,7 @@ async fn async_main() -> Result<()> {
                         512,
                         cli.scout_factor,
                     );
-                    let _ = c.store_scout(&key, &surface_priors_rs::pipeline::scenestats_to_cache(&s));
+                    let _ = c.store_scout(&key, &bestpixel::pipeline::scenestats_to_cache(&s));
                 }
                 stats_map.insert(s.item_id.clone(), s);
             }
@@ -315,7 +315,7 @@ async fn async_main() -> Result<()> {
     eprintln!("scout:          {:6.2}s  ({} scored)", timing.scout, stats_map.len());
 
     // --- Build chunk-level tile partition + select -------------------------
-    let chunks = surface_priors_rs::tile_classification::chunks_from_grid(
+    let chunks = bestpixel::tile_classification::chunks_from_grid(
         grid.bounds,
         grid.resolution,
         (grid.width, grid.height),
@@ -329,7 +329,7 @@ async fn async_main() -> Result<()> {
         .collect();
     // Try disk cache for tile partition.
     let partition_disk_hit = if let Some(c) = &cache {
-        let scenes_sig = surface_priors_rs::tile_classification::scenes_signature(
+        let scenes_sig = bestpixel::tile_classification::scenes_signature(
             &items
                 .iter()
                 .map(|s| (s.id.clone(), s.mgrs_tile.clone(), s.geometry.clone()))
@@ -344,7 +344,7 @@ async fn async_main() -> Result<()> {
     let partition = if let Some((p, _)) = partition_disk_hit.as_ref() {
         Some(p.clone())
     } else {
-        let built = surface_priors_rs::tile_classification::build_partition(
+        let built = bestpixel::tile_classification::build_partition(
             &chunks,
             &grid.proj_def(),
             &scene_geoms,
@@ -352,7 +352,7 @@ async fn async_main() -> Result<()> {
             (grid.resolution * grid.resolution) as f64,
         )?;
         if let (Some(p), Some(c)) = (built.as_ref(), cache.as_ref()) {
-            let scenes_sig = surface_priors_rs::tile_classification::scenes_signature(
+            let scenes_sig = bestpixel::tile_classification::scenes_signature(
                 &items
                     .iter()
                     .map(|s| (s.id.clone(), s.mgrs_tile.clone(), s.geometry.clone()))
@@ -393,7 +393,7 @@ async fn async_main() -> Result<()> {
     // HLS L30 and S30 use different asset keys for the same band.
     let band_names_out: Vec<&'static str> =
         endpoint.band_names_supported.iter().copied().collect();
-    let scenes_for_fetch: Vec<surface_priors_rs::stac::StacItem> = picks.iter().map(|p| p.scene.clone()).collect();
+    let scenes_for_fetch: Vec<bestpixel::stac::StacItem> = picks.iter().map(|p| p.scene.clone()).collect();
     let mut band_tasks = FuturesUnordered::new();
     for (scene_idx, scene) in scenes_for_fetch.iter().enumerate() {
         for (band_idx, band_name) in band_names_out.iter().enumerate() {
@@ -483,7 +483,7 @@ async fn async_main() -> Result<()> {
         let t = Instant::now();
         std::fs::create_dir_all(&cli.out_dir)
             .with_context(|| format!("mkdir {}", cli.out_dir.display()))?;
-        let geo_params = |nodata: u16| surface_priors_rs::writer::GeoTiffParams {
+        let geo_params = |nodata: u16| bestpixel::writer::GeoTiffParams {
             width: grid.width,
             height: grid.height,
             tile_size: 256,
@@ -509,7 +509,7 @@ async fn async_main() -> Result<()> {
         band_paths
             .par_iter()
             .try_for_each(|(path, i)| -> anyhow::Result<()> {
-                surface_priors_rs::writer::write_uint16_geotiff(
+                bestpixel::writer::write_uint16_geotiff(
                     path,
                     &composite.bands[*i],
                     geo_params(65535),
@@ -518,21 +518,21 @@ async fn async_main() -> Result<()> {
             })?;
         rayon::scope(|s| {
             s.spawn(|_| {
-                let _ = surface_priors_rs::writer::write_uint16_geotiff(
+                let _ = bestpixel::writer::write_uint16_geotiff(
                     &cli.out_dir.join("quality.tif"),
                     &composite.quality,
                     geo_params(65535),
                 );
             });
             s.spawn(|_| {
-                let _ = surface_priors_rs::writer::write_uint16_geotiff(
+                let _ = bestpixel::writer::write_uint16_geotiff(
                     &cli.out_dir.join("observation_count.tif"),
                     &composite.observation_count,
                     geo_params(0),
                 );
             });
             s.spawn(|_| {
-                let _ = surface_priors_rs::writer::write_int16_geotiff(
+                let _ = bestpixel::writer::write_int16_geotiff(
                     &cli.out_dir.join("selected_observation.tif"),
                     &composite.selected_observation,
                     geo_params(0xFFFF),
