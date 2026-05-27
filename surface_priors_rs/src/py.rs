@@ -144,7 +144,7 @@ use crate::tile_classification::{build_partition, chunks_from_grid, scenes_signa
     resolution = 60.0,
     top_k = 3,
     max_cloud_cover = 90.0,
-    concurrency = 600,
+    concurrency = 192,
     endpoint = "auto".to_string(),
     disk_cache = None,
     scout_factor = 8,
@@ -196,7 +196,7 @@ fn build_composite(
     resolution = 60.0,
     top_k = 3,
     max_cloud_cover = 90.0,
-    concurrency = 600,
+    concurrency = 192,
     endpoint = "auto".to_string(),
     disk_cache = None,
     scout_factor = 8,
@@ -377,6 +377,10 @@ fn run_build(
     let cpus = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(2);
+    // Cap by CPUs as a floor of safety; the request concurrency default
+    // (192) was tuned against Planetary Computer: a 5-year Egypt batch ran
+    // ~13s at 192 vs ~23s at 600 — oversubscribing the blob endpoint gives
+    // no extra throughput and trips its 429 rate-limit (→ backoff).
     let safe_concurrency = (cpus.saturating_mul(50)).max(50);
     let effective_concurrency = concurrency.min(safe_concurrency);
 
@@ -823,6 +827,10 @@ fn run_build_periods(
     let cpus = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(2);
+    // Cap by CPUs as a floor of safety; the request concurrency default
+    // (192) was tuned against Planetary Computer: a 5-year Egypt batch ran
+    // ~13s at 192 vs ~23s at 600 — oversubscribing the blob endpoint gives
+    // no extra throughput and trips its 429 rate-limit (→ backoff).
     let safe_concurrency = (cpus.saturating_mul(50)).max(50);
     let effective_concurrency = concurrency.min(safe_concurrency);
 
