@@ -25,9 +25,9 @@ jobs:
           # x86_64 keeps the AVX2/FMA hot path (x86-64-v3 baseline);
           # macOS arm64 compiles the scalar resampler fallback
           # (grid.rs gates AVX2 behind cfg(target_arch = "x86_64")).
-          # aarch64-linux is intentionally omitted: its cross image lacks
-          # PROJ >= 9, triggering a slow/fragile from-source PROJ build
-          # under QEMU. aarch64-linux users install from the sdist.
+          # Omitted (covered by the sdist): aarch64-linux (cross image lacks
+          # PROJ >= 9 → slow from-source build under QEMU) and x86_64 macOS
+          # (macos-13 Intel runners queue for hours; Apple Silicon dominates).
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
             manylinux: "2_28"
@@ -35,9 +35,6 @@ jobs:
           - target: aarch64-apple-darwin
             runner: macos-14
             rustflags: ""
-          - target: x86_64-apple-darwin
-            runner: macos-13
-            rustflags: "-C target-cpu=x86-64-v3"
     steps:
       - uses: actions/checkout@v4
 
