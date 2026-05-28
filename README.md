@@ -2,6 +2,15 @@
 
 `surface-priors` builds native-grid surface prior products and persists them as a STAC Item with tiled, DEFLATE-compressed GeoTIFF assets. The current implementation provides a MODIS/VIIRS BRDF prior builder; the package boundary is intentionally broader so later providers can add direct surface reflectance priors from sensors such as Sentinel-2 or Landsat.
 
+> **This repository ships two independent, separately-installed packages — pick the one you need:**
+>
+> | Package | Install | What it does |
+> |---|---|---|
+> | **[`surface-priors`](https://pypi.org/project/surface-priors/)** (this README) | `pip install surface-priors` | Builds native-grid surface **prior products** and writes them as STAC + GeoTIFF (MODIS/VIIRS BRDF today). |
+> | **[`bestpixel`](https://pypi.org/project/bestpixel/)** (Rust, in [`surface_priors_rs/`](surface_priors_rs/)) | `pip install bestpixel` | Fast best-pixel **cloud-free composites** from STAC/COG sources (Sentinel-2 L2A, HLS, MCD43A4), returned as numpy arrays — see the [`bestpixel`](#bestpixel-fast-cloud-free-composites-rust) section below. |
+>
+> They share lineage but are distinct distributions; you do **not** need both.
+
 Calendar planning is intentionally outside the core builder: callers decide which observations should enter a prior, then this package composites those observations and writes a consistent product.
 
 ```python
@@ -59,7 +68,7 @@ Planned extension point:
 
 - Direct surface reflectance prior sources such as Sentinel-2 or Landsat, provided they can deliver observations aligned to the requested native grid.
 
-## Sentinel-2 L2A composites (Rust)
+## `bestpixel`: fast cloud-free composites (Rust)
 
 The `surface_priors_rs/` directory in this repo contains a separately
 distributed Rust crate, published on PyPI as **[`bestpixel`](https://pypi.org/project/bestpixel/)**,
@@ -119,7 +128,9 @@ and macOS arm64; other platforms build from the sdist).
 See [`surface_priors_rs/README.md`](surface_priors_rs/README.md) for
 the full API, CLI usage, architecture, and benchmark details.
 
-This package owns:
+## `surface-priors` responsibilities
+
+`surface-priors` owns:
 
 - WGS84 AOI bounds conversion into the native prior data CRS.
 - Google Earth Engine BRDF product downloading through `edown`.
@@ -141,7 +152,7 @@ Callers own:
 
 The public AOI input is always WGS84 longitude/latitude bounds: `(west, south, east, north)`. The package converts those bounds to the configured native prior data CRS, which defaults to MODIS/VIIRS Sinusoidal for BRDF sources. The builder still does not reproject source arrays internally; observations must already match the derived native grid.
 
-## Installation
+## Installing `surface-priors`
 
 ```bash
 pip install surface-priors
