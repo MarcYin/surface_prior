@@ -59,10 +59,14 @@ On a 16-core node it builds 5 years × 1 month over a 100 × 100 km
 S2/HLS AOI at 60 m in roughly 6-7 seconds, network-bound against
 Planetary Computer.
 
-```python
-import surface_priors_rs as spx
+```bash
+pip install bestpixel
+```
 
-out = spx.build_composite(
+```python
+import bestpixel as bp
+
+out = bp.build_composite(
     bbox=(30.5, 30.5, 31.6, 31.5),
     datetime="2024-07-01/2024-07-31",
     resolution=60.0,
@@ -74,5 +78,5 @@ red = out["bands"]["red"]   # uint16 ndarray (H, W)
 
 Source and full docs live under
 [`surface_priors_rs/`](https://github.com/MarcYin/surface_prior/tree/main/surface_priors_rs)
-in the repo. Wheels for CPython 3.9–3.14 are attached to each GitHub
-Release tagged `rs-v*`.
+in the repo. Published on PyPI as [`bestpixel`](https://pypi.org/project/bestpixel/);
+one abi3 wheel covers CPython 3.9–3.14.

@@ -62,10 +62,11 @@ Planned extension point:
 ## Sentinel-2 L2A composites (Rust)
 
 The `surface_priors_rs/` directory in this repo contains a separately
-distributed Rust crate, **`surface-priors-rs`**, that builds best-pixel
-monthly composites end-to-end (STAC search → MGRS tile-aware selection
-→ COG fetch → resample → compose) and exposes them to Python as numpy
-arrays — no GeoTIFF writes required. Four sources are supported:
+distributed Rust crate, published on PyPI as **[`bestpixel`](https://pypi.org/project/bestpixel/)**,
+that builds best-pixel monthly composites end-to-end (STAC search → MGRS
+tile-aware selection → COG fetch → resample → compose) and exposes them
+to Python as numpy arrays — no GeoTIFF writes required. Four sources are
+supported:
 Sentinel-2 L2A via Planetary Computer (default) or Element84;
 Harmonized Landsat-Sentinel-2 (HLS v2.0) L30 + S30 via PC, combined
 into one harmonized 7-band pool; and MODIS MCD43A4 NBAR (daily 500 m,
@@ -75,11 +76,15 @@ On a 16-core node from JASMIN it produces 5 years × 1 month over a
 100 × 100 km AOI at 60 m in about **6 seconds** parallel or **11
 seconds** sequential, network-bound against Planetary Computer.
 
+```bash
+pip install bestpixel
+```
+
 ```python
-import surface_priors_rs as spx
+import bestpixel as bp
 
 # Sentinel-2 L2A (12 bands)
-out = spx.build_composite(
+out = bp.build_composite(
     bbox=(30.5, 30.5, 31.6, 31.5),
     datetime="2024-07-01/2024-07-31",
     resolution=60.0,
@@ -88,7 +93,7 @@ out = spx.build_composite(
 )
 
 # Harmonized Landsat-Sentinel-2 (7 common bands, Roy et al. NBAR)
-out = spx.build_composite(
+out = bp.build_composite(
     bbox=(30.5, 30.5, 31.6, 31.5),
     datetime="2024-07-01/2024-07-31",
     resolution=60.0,
@@ -96,7 +101,7 @@ out = spx.build_composite(
 )
 
 # MODIS MCD43A4 NBAR (6 bands, native 500 m, output in MODIS Sinusoidal)
-out = spx.build_composite(
+out = bp.build_composite(
     bbox=(30.5, 30.5, 31.6, 31.5),
     datetime="2024-07-01/2024-07-31",
     resolution=500.0,
@@ -108,12 +113,8 @@ quality = out["quality"]       # 0=clear, 1=marginal, 2=dark, 65535=nodata
 print(out["grid"])             # bounds, epsg, transform
 ```
 
-Install from a prebuilt wheel attached to a GitHub Release (one abi3
-wheel covers Python 3.9 through 3.14):
-
-```bash
-pip install <wheel-url-from-rs-v*-release>
-```
+One abi3 wheel covers Python 3.9 through 3.14 (prebuilt for Linux x86_64
+and macOS arm64; other platforms build from the sdist).
 
 See [`surface_priors_rs/README.md`](surface_priors_rs/README.md) for
 the full API, CLI usage, architecture, and benchmark details.
