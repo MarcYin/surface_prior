@@ -31,12 +31,12 @@ CONFIGS = {
 
 
 def run_one(name: str) -> dict:
-    import bestpixel as spx
+    import bestpixel as bp
     import numpy as np
     cache = f"/tmp/bench-adapt-{name.replace('=', '').replace('+', '-')}"
     shutil.rmtree(cache, ignore_errors=True)
     t0 = time.time()
-    res = spx.build_monthly_composites(
+    res = bp.build_monthly_composites(
         bbox=BBOX, years=YEARS, months=[7], resolution=60.0,
         endpoint="pc", disk_cache=cache, bands=BANDS, **CONFIGS[name])
     wall = time.time() - t0

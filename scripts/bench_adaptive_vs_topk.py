@@ -19,7 +19,7 @@ import argparse
 import sys
 import time
 
-import bestpixel as spx
+import bestpixel as bp
 import numpy as np
 
 BBOX = (30.5, 30.5, 31.6, 31.5)  # Nile Delta, WGS84
@@ -39,7 +39,7 @@ def _coverage(obs: np.ndarray) -> tuple[float, float]:
 
 
 def _build(year: int, month: int, cache: str, **sel) -> dict:
-    return spx.build_composite(
+    return bp.build_composite(
         bbox=BBOX,
         datetime=f"{year}-{month:02d}-01/{year}-{month:02d}-28",
         resolution=RESOLUTION,

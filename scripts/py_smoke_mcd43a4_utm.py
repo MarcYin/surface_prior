@@ -1,13 +1,13 @@
 """Smoke-test MCD43A4 with output_crs="utm" — reproject sinusoidal → UTM on the fly."""
 import time
 
-import bestpixel as spx
+import bestpixel as bp
 
 BBOX = (30.5, 30.5, 31.6, 31.5)
 
 print("=== MCD43A4, output_crs='native' (sinusoidal) ===")
 t0 = time.time()
-native = spx.build_composite(
+native = bp.build_composite(
     bbox=BBOX,
     datetime="2024-07-01/2024-07-31",
     resolution=500.0,
@@ -21,7 +21,7 @@ print(f"  {time.time() - t0:.2f}s  grid={native['grid']['width']}x{native['grid'
 
 print("=== MCD43A4, output_crs='utm' (reproject) ===")
 t0 = time.time()
-utm = spx.build_composite(
+utm = bp.build_composite(
     bbox=BBOX,
     datetime="2024-07-01/2024-07-31",
     resolution=500.0,

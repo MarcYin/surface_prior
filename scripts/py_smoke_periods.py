@@ -1,11 +1,11 @@
 """Smoke-test the new multi-month/multi-year API."""
 import time
 
-import bestpixel as spx
+import bestpixel as bp
 
 print("=== JJA 2018-2020 (9 periods) ===")
 t0 = time.time()
-out = spx.build_monthly_composites(
+out = bp.build_monthly_composites(
     bbox=(30.5, 30.5, 31.6, 31.5),
     years=[2018, 2019, 2020],
     months=[6, 7, 8],

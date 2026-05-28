@@ -54,9 +54,9 @@ maturin develop --release --features python
 ## Use from Python
 
 ```python
-import bestpixel as spx
+import bestpixel as bp
 
-out = spx.build_composite(
+out = bp.build_composite(
     bbox=(30.5, 30.5, 31.6, 31.5),         # west, south, east, north (WGS84)
     datetime="2024-07-01/2024-07-31",      # STAC datetime range
     resolution=60.0,                        # metres
@@ -83,7 +83,7 @@ over the chunks that need it (far fewer bytes when depth is concentrated,
 e.g. an under-observed swath-edge corner):
 
 ```python
-out = spx.build_composite(
+out = bp.build_composite(
     bbox=(30.5, 30.5, 31.6, 31.5),
     datetime="2024-07-01/2024-07-31",
     coverage_target=0.95, min_k=2, max_k=6,   # adaptive per-chunk depth
@@ -108,7 +108,7 @@ STAC search + scout pass. Cleaner than looping `build_composite` in
 Python, and faster because the search + scout work is amortised.
 
 ```python
-out = spx.build_monthly_composites(
+out = bp.build_monthly_composites(
     bbox=(30.5, 30.5, 31.6, 31.5),
     years=[2018, 2019, 2020],
     months=[6, 7, 8],          # June / July / August
@@ -139,7 +139,7 @@ B8A (narrow NIR — the harmonized choice from Roy 2021), not S2's B08
 broad NIR.
 
 ```python
-out = spx.build_composite(
+out = bp.build_composite(
     bbox=(30.5, 30.5, 31.6, 31.5),
     datetime="2024-07-01/2024-07-31",
     resolution=60.0,
@@ -165,7 +165,7 @@ reprojection to UTM. The returned `grid` dict reports `epsg=0` and
 carries the proj4 string instead:
 
 ```python
-out = spx.build_composite(
+out = bp.build_composite(
     bbox=(30.5, 30.5, 31.6, 31.5),
     datetime="2024-07-01/2024-07-31",
     resolution=500.0,           # MODIS native
@@ -192,7 +192,7 @@ sinusoidal coordinates but bilinearly reprojects to UTM during the
 resample step (per-pixel PROJ transform; no extra disk passes).
 
 ```python
-out = spx.build_composite(
+out = bp.build_composite(
     bbox=(30.5, 30.5, 31.6, 31.5),
     datetime="2024-07-01/2024-07-31",
     resolution=500.0,

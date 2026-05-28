@@ -2,7 +2,7 @@
 import shutil
 import time
 
-import bestpixel as spx
+import bestpixel as bp
 
 CACHE = "/tmp/spx-profile-pc"
 
@@ -11,7 +11,7 @@ def run(label, *, cold):
     if cold:
         shutil.rmtree(CACHE, ignore_errors=True)
     t0 = time.time()
-    out = spx.build_composite(
+    out = bp.build_composite(
         bbox=(30.5, 30.5, 31.6, 31.5),
         datetime="2024-07-01/2024-07-31",
         resolution=60.0,
@@ -49,7 +49,7 @@ years = [2020, 2021, 2022, 2023, 2024]
 t0 = time.time()
 for y in years:
     yt0 = time.time()
-    out = spx.build_composite(
+    out = bp.build_composite(
         bbox=(30.5, 30.5, 31.6, 31.5),
         datetime=f"{y}-07-01/{y}-07-31",
         resolution=60.0,

@@ -17,7 +17,7 @@ import sys
 import time
 from pathlib import Path
 
-import bestpixel as spx
+import bestpixel as bp
 import numpy as np
 
 BBOX = (30.5, 30.5, 31.6, 31.5)
@@ -31,7 +31,7 @@ CONFIGS = {
 
 def _run(years, month, cache: str, sel: dict) -> tuple[float, list[dict]]:
     t0 = time.perf_counter()
-    results = spx.build_monthly_composites(
+    results = bp.build_monthly_composites(
         bbox=BBOX, years=years, months=[month], resolution=60.0,
         endpoint="pc", disk_cache=cache, bands=BANDS, **sel,
     )

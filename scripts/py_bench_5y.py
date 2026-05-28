@@ -23,9 +23,9 @@ BANDS = ["coastal", "blue", "green", "red", "nir", "swir16", "swir22"]
 def one(year: int, concurrency: int):
     # Import inside the function so it works under spawn-based
     # multiprocessing (children re-import on fork-spawn boundary).
-    import bestpixel as _spx
+    import bestpixel as bp
     t0 = time.time()
-    out = _spx.build_composite(
+    out = bp.build_composite(
         bbox=BBOX,
         datetime=f"{year}-07-01/{year}-07-31",
         resolution=60.0,

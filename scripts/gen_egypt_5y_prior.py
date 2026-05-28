@@ -12,7 +12,7 @@ from pathlib import Path
 # Import bestpixel first: its package init pins PROJ_DATA so rasterio's
 # GDAL/PROJ no longer clobbers the native WGS84->UTM transform — import order
 # is no longer load-bearing, so rasterio can be imported normally up top.
-import bestpixel as spx
+import bestpixel as bp
 import numpy as np
 import rasterio
 from affine import Affine
@@ -89,7 +89,7 @@ def main() -> int:
     # sequentially so the fetches don't oversubscribe the connection pool.
     # ~13s cold for this 5-period Nile Delta batch vs ~15s looping
     # build_composite (and vs ~24s before the py.rs fixes).
-    results = spx.build_monthly_composites(
+    results = bp.build_monthly_composites(
         bbox=BBOX,
         years=YEARS,
         months=[MONTH],

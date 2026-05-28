@@ -5,11 +5,11 @@ proj4 instead of a real EPSG.
 """
 import time
 
-import bestpixel as spx
+import bestpixel as bp
 import numpy as np
 
 t0 = time.time()
-out = spx.build_composite(
+out = bp.build_composite(
     bbox=(30.5, 30.5, 31.6, 31.5),
     datetime="2024-07-01/2024-07-31",
     resolution=500.0,

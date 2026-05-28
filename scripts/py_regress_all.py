@@ -1,12 +1,12 @@
 """Quick regression: build a 1-month composite via each endpoint."""
 import time
 
-import bestpixel as spx
+import bestpixel as bp
 
 for endpoint in ["pc", "hls", "mcd43a4"]:
     res = 500.0 if endpoint == "mcd43a4" else 60.0
     t0 = time.time()
-    out = spx.build_composite(
+    out = bp.build_composite(
         bbox=(30.5, 30.5, 31.6, 31.5),
         datetime="2024-07-01/2024-07-31",
         resolution=res,

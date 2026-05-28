@@ -5,7 +5,7 @@ back numpy arrays with the expected dtype/shape — no GeoTIFF writes.
 """
 import time
 
-import bestpixel as spx
+import bestpixel as bp
 import numpy as np
 
 # Nile Delta AOI used across the CLI benchmarks — spans multiple MGRS
@@ -15,7 +15,7 @@ bbox = (30.5, 30.5, 31.6, 31.5)
 datetime_str = "2024-07-01/2024-07-31"
 
 t0 = time.time()
-out = spx.build_composite(
+out = bp.build_composite(
     bbox=bbox,
     datetime=datetime_str,
     resolution=60.0,

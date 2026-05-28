@@ -17,7 +17,7 @@ from pathlib import Path
 # Import bestpixel first: its package init pins PROJ_DATA so rasterio's
 # GDAL/PROJ no longer clobbers the native WGS84->UTM transform — import order
 # is no longer load-bearing, so rasterio/PIL can be imported normally up top.
-import bestpixel as spx
+import bestpixel as bp
 import numpy as np
 import rasterio
 from affine import Affine
@@ -113,7 +113,7 @@ def main() -> int:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     print(f"Egypt 5y adaptive prior  AOI={BBOX}  years={YEARS} month={MONTH}  sel={SEL}")
     t0 = time.time()
-    results = spx.build_monthly_composites(
+    results = bp.build_monthly_composites(
         bbox=BBOX, years=YEARS, months=[MONTH], resolution=RESOLUTION,
         endpoint=ENDPOINT, disk_cache=DISK_CACHE, bands=BANDS, **SEL,
     )
