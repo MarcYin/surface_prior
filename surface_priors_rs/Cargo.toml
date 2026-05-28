@@ -1,6 +1,6 @@
 [package]
 name = "bestpixel"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Production Rust port of the surface_priors monthly composite pipeline."
 
