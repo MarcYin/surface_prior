@@ -32,6 +32,7 @@ const TAG_TILE_LENGTH: u16 = 323;
 const TAG_TILE_OFFSETS: u16 = 324;
 const TAG_TILE_BYTE_COUNTS: u16 = 325;
 const TAG_SUB_IFDS: u16 = 330;
+const TAG_SAMPLE_FORMAT: u16 = 339;
 const TAG_GEO_TIFF_KEYS: u16 = 34735;
 const TAG_PIXEL_SCALE: u16 = 33550;
 const TAG_TIE_POINT: u16 = 33922;
@@ -47,13 +48,17 @@ const COMPRESSION_ADOBE_DEFLATE: u32 = 32946;
 pub enum SampleFormat {
     UInt8,
     UInt16,
+    /// Signed 16-bit. HLS surface reflectance is stored this way (fill
+    /// -9999, scale 1e-4); the bytes are decoded identically to UInt16,
+    /// but callers must reinterpret as `i16` and clamp negatives/fill.
+    Int16,
 }
 
 impl SampleFormat {
     pub fn bytes(self) -> usize {
         match self {
             SampleFormat::UInt8 => 1,
-            SampleFormat::UInt16 => 2,
+            SampleFormat::UInt16 | SampleFormat::Int16 => 2,
         }
     }
 }
@@ -269,10 +274,17 @@ async fn parse_cog(http: &reqwest::Client, url: &str, header: Bytes) -> Result<C
         levels.push(ifd_to_level(&ifd));
     }
 
-    let sample_format = match (ifd0.bits_per_sample, ifd0.samples_per_pixel) {
-        (8, _) => SampleFormat::UInt8,
-        (16, _) => SampleFormat::UInt16,
-        other => return Err(anyhow!("unsupported sample shape {:?}", other)),
+    // SampleFormat tag (339): 2 = signed int. HLS reflectance is signed
+    // Int16; without this the bytes get read as UInt16 and the -9999 fill
+    // (and any negative reflectance) becomes a huge positive value.
+    let signed = ifd0.sample_format_code == 2;
+    let sample_format = match (ifd0.bits_per_sample, ifd0.samples_per_pixel, signed) {
+        (8, _, _) => SampleFormat::UInt8,
+        (16, _, true) => SampleFormat::Int16,
+        (16, _, false) => SampleFormat::UInt16,
+        (bps, spp, _) => {
+            return Err(anyhow!("unsupported sample shape {:?}", (bps, spp)))
+        }
     };
 
     Ok(CogProfile {
@@ -745,6 +757,10 @@ struct Ifd {
     height: u32,
     bits_per_sample: u32,
     samples_per_pixel: u32,
+    /// TIFF SampleFormat (tag 339): 1 = unsigned int (default when
+    /// absent), 2 = signed int, 3 = IEEE float. 0 means the tag was not
+    /// present, treated as unsigned.
+    sample_format_code: u32,
     compression: u32,
     tile_width: u32,
     tile_height: u32,
@@ -789,6 +805,10 @@ async fn parse_ifd(buffer: &mut HeaderBuffer<'_>, offset: u64) -> Result<Ifd> {
             }
             TAG_SAMPLES_PER_PIXEL => {
                 ifd.samples_per_pixel = read_scalar_u32(buffer, typ, count, value_or_offset).await?
+            }
+            TAG_SAMPLE_FORMAT => {
+                ifd.sample_format_code =
+                    read_scalar_u32(buffer, typ, count, value_or_offset).await?
             }
             TAG_COMPRESSION => {
                 ifd.compression = read_scalar_u32(buffer, typ, count, value_or_offset).await?

@@ -420,7 +420,8 @@ async fn async_main() -> Result<()> {
         let grid = grid.clone();
         let sem = request_semaphore.clone();
         band_tasks.push(tokio::spawn(async move {
-            let res = fetch_quality(http, &scene, &grid, sem, &quality_asset, None).await?;
+            let res =
+                fetch_quality(http, &scene, &grid, sem, &quality_asset, quality_kind, None).await?;
             Ok::<(usize, usize, Option<Vec<u16>>), anyhow::Error>((
                 scene_idx,
                 usize::MAX,

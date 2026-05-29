@@ -212,6 +212,7 @@ pub async fn scout_scene(
             dst_origin,
             grid.resolution,
             &grid_proj,
+            quality_kind.nodata_fill(),
         )?
     } else {
         resample_u8_to_u8(
@@ -222,6 +223,7 @@ pub async fn scout_scene(
             (dst_w, dst_h),
             dst_origin,
             grid.resolution,
+            quality_kind.nodata_fill(),
         )?
     };
     let (usable, mean_clear) = quality_to_stats(&quality_buf, quality_kind);
@@ -731,7 +733,8 @@ pub async fn fetch_band(
     let cog = open_cog(&http, &url).await.ok();
     let dt_open = t_open.elapsed().as_secs_f64();
     let Some(cog) = cog else { return Ok(None) };
-    if cog.sample_format != SampleFormat::UInt16 {
+    // Accept both unsigned (S2) and signed (HLS) 16-bit reflectance.
+    if !matches!(cog.sample_format, SampleFormat::UInt16 | SampleFormat::Int16) {
         return Ok(None);
     }
     let native_res = cog
@@ -793,6 +796,15 @@ pub async fn fetch_band(
     {
         let buf_bytes: &mut [u8] = bytemuck::cast_slice_mut(&mut src_u16);
         stitch_tiles(buf_bytes, win, level, &decoded, 2)?;
+    }
+    // Signed sources (HLS Int16) share the same DN/10000 reflectance scale
+    // as S2, so the only fix-up is reinterpreting the bits as `i16` and
+    // clamping the -9999 fill / negative reflectance to 0. Pixels clamped
+    // here sit under the scene's own Fmask nodata, so compose skips them.
+    if cog.sample_format == SampleFormat::Int16 {
+        for v in src_u16.iter_mut() {
+            *v = (*v as i16).max(0) as u16;
+        }
     }
     let dt_stitch = t_stitch.elapsed().as_secs_f64();
     let level_origin = [
@@ -878,6 +890,7 @@ pub async fn fetch_quality(
     grid: &GridSpec,
     semaphore: Arc<tokio::sync::Semaphore>,
     quality_asset: &str,
+    quality_kind: QualityKind,
     source_proj: Option<&str>,
 ) -> Result<Option<Vec<u8>>> {
     let Some(url) = scene.assets.get(quality_asset).cloned() else {
@@ -944,6 +957,7 @@ pub async fn fetch_quality(
             dst_origin,
             grid.resolution,
             &grid_proj,
+            quality_kind.nodata_fill(),
         )?
     } else {
         resample_u8_to_u8(
@@ -954,6 +968,7 @@ pub async fn fetch_quality(
             (grid.width, grid.height),
             dst_origin,
             grid.resolution,
+            quality_kind.nodata_fill(),
         )?
     };
     Ok(Some(scl))

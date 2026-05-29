@@ -694,6 +694,7 @@ fn run_build(
                     &grid,
                     sem,
                     &quality_asset,
+                    quality_kind,
                     source_proj_for_fetch,
                 )
                 .await?;
@@ -1245,6 +1246,7 @@ async fn compose_one_period(
                 &grid,
                 sem,
                 &quality_asset,
+                quality_kind,
                 source_proj,
             )
             .await?;

@@ -145,7 +145,12 @@ pub fn resample_u16_to_u16(
 ) -> Result<Vec<u16>> {
     let (sw, sh) = (src_dim.0 as usize, src_dim.1 as usize);
     let (dw, dh) = (dst_dim.0 as usize, dst_dim.1 as usize);
-    let mut out = vec![0u16; dw * dh];
+    // Out-of-source pixels stay nodata (65535), matching the cross-CRS
+    // `reproject_u16_to_u16` path. A scene that only partially covers the
+    // AOI must not paint the uncovered region with a literal reflectance 0
+    // — compose gates bands on quality, but keeping the band itself nodata
+    // is defense-in-depth.
+    let mut out = vec![65535u16; dw * dh];
     let inv_src_px = 1.0 / src_pixel_size;
     let x_origin_delta = (dst_origin[0] - src_origin[0]) * inv_src_px;
     let y_origin_delta = (src_origin[1] - dst_origin[1]) * inv_src_px;
@@ -595,7 +600,9 @@ pub fn reproject_u16_to_u16(
 
 /// Nearest u8 → u8 with on-the-fly reprojection. Same pattern as the
 /// u16 bilinear variant; used for SCL / Fmask / mandatory-quality
-/// rasters that must stay categorical across CRS changes.
+/// rasters that must stay categorical across CRS changes. `fill` is the
+/// value for out-of-source pixels — pass the quality kind's nodata byte
+/// so uncovered AOI does not read as a (clear) class.
 #[allow(clippy::too_many_arguments)]
 pub fn reproject_u8_to_u8(
     src: &[u8],
@@ -607,6 +614,7 @@ pub fn reproject_u8_to_u8(
     dst_origin: [f64; 2],
     dst_pixel_size: f64,
     dst_proj: &str,
+    fill: u8,
 ) -> Result<Vec<u8>> {
     let (sw, sh) = (src_dim.0 as usize, src_dim.1 as usize);
     let (dw, dh) = (dst_dim.0 as usize, dst_dim.1 as usize);
@@ -627,7 +635,7 @@ pub fn reproject_u8_to_u8(
     }
     crate::projx::transform_points(dst_proj, src_proj, &mut points)?;
 
-    let mut out = vec![0u8; dw * dh];
+    let mut out = vec![fill; dw * dh];
     for (i, &(sx, sy)) in points.iter().enumerate() {
         if !sx.is_finite() || !sy.is_finite() {
             continue;
@@ -643,6 +651,9 @@ pub fn reproject_u8_to_u8(
 }
 
 /// Nearest-neighbour u8 → u8 resample (for SCL / classification rasters).
+/// `fill` is the value for out-of-source pixels — pass the quality kind's
+/// nodata byte so uncovered AOI does not read as a (clear) class.
+#[allow(clippy::too_many_arguments)]
 pub fn resample_u8_to_u8(
     src: &[u8],
     src_dim: (u32, u32),
@@ -651,10 +662,11 @@ pub fn resample_u8_to_u8(
     dst_dim: (u32, u32),
     dst_origin: [f64; 2],
     dst_pixel_size: f64,
+    fill: u8,
 ) -> Result<Vec<u8>> {
     let (sw, sh) = (src_dim.0 as usize, src_dim.1 as usize);
     let (dw, dh) = (dst_dim.0 as usize, dst_dim.1 as usize);
-    let mut out = vec![0u8; dw * dh];
+    let mut out = vec![fill; dw * dh];
     out.chunks_mut(dw).enumerate().for_each(|(r, row)| {
         let world_y = dst_origin[1] - (r as f64 + 0.5) * dst_pixel_size;
         let src_r = ((src_origin[1] - world_y) / src_pixel_size).floor() as i64;
