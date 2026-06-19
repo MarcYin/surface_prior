@@ -20,6 +20,7 @@ site/
 # Large local composite outputs / build artifacts (not for the repo)
 egypt_5y_prior/
 egypt_5y_prior_adaptive/
+egypt_5y_prior_hls/
 .real-builds/
 .real-builds-tile-aware/
 # Local agent/editor settings
