@@ -45,6 +45,19 @@ impl GridSpec {
     /// `transform_bounds` is accurate to sub-pixel.
     pub fn from_wgs84_bounds(bbox: [f64; 4], resolution: f64) -> Self {
         let epsg = projx::utm_epsg_for_wgs84_bounds(bbox);
+        Self::from_wgs84_bounds_with_epsg(bbox, resolution, epsg)
+    }
+
+    /// Like [`Self::from_wgs84_bounds`] but forces the NORTHERN UTM zone
+    /// (false_northing = 0), matching HLS's georeferencing convention so the
+    /// grid aligns with southern-hemisphere HLS COGs. See
+    /// [`projx::utm_epsg_for_wgs84_bounds_north`].
+    pub fn from_wgs84_bounds_force_north(bbox: [f64; 4], resolution: f64) -> Self {
+        let epsg = projx::utm_epsg_for_wgs84_bounds_north(bbox);
+        Self::from_wgs84_bounds_with_epsg(bbox, resolution, epsg)
+    }
+
+    fn from_wgs84_bounds_with_epsg(bbox: [f64; 4], resolution: f64, epsg: u32) -> Self {
         let utm = projx::wgs84_to_utm_bounds(bbox, epsg).expect("PROJ WGS84→UTM");
         let snapped = projx::snap_bounds(utm, resolution);
         let width = ((snapped[2] - snapped[0]) / resolution).round() as u32;
@@ -111,10 +124,17 @@ pub fn cog_window_for_utm(
     let row0 = ((oy - utm_bounds[3]) / pix).floor() as i64;
     let col1 = ((utm_bounds[2] - ox) / pix).ceil() as i64;
     let row1 = ((oy - utm_bounds[1]) / pix).ceil() as i64;
-    let col0 = col0.max(0) as u32;
-    let row0 = row0.max(0) as u32;
-    let col1 = col1.min(image_width as i64) as u32;
-    let row1 = row1.min(image_height as i64) as u32;
+    // Clamp BOTH ends of each span to the valid pixel range in i64 before any
+    // u32 cast. Clamping only one end (col0>=0, col1<=width) let an AOI that
+    // falls entirely off the negative side of the image produce a negative
+    // col1/row1 that wrapped to ~2^32 when cast to u32 (the empty-window check
+    // then passed, yielding a ~4GB window and an out-of-range stitch index).
+    let iw = image_width as i64;
+    let ih = image_height as i64;
+    let col0 = col0.clamp(0, iw) as u32;
+    let row0 = row0.clamp(0, ih) as u32;
+    let col1 = col1.clamp(0, iw) as u32;
+    let row1 = row1.clamp(0, ih) as u32;
     if col1 <= col0 || row1 <= row0 {
         return None;
     }
@@ -683,4 +703,57 @@ pub fn resample_u8_to_u8(
         }
     });
     Ok(out)
+}
+
+#[cfg(test)]
+mod window_crs_tests {
+    use super::*;
+
+    #[test]
+    fn cog_window_aoi_off_negative_side_is_none_not_u32_underflow() {
+        // Regression: an AOI entirely on the negative side of the image used to
+        // wrap col1/row1 to ~2^32 (signed i64 -> u32 cast) and return a ~4 GB
+        // window, which then panicked in stitch_tiles with an out-of-range index.
+        let origin = [600_000.0, 0.0];
+        // AOI entirely WEST of the image easting span [600000, 709800].
+        let west = cog_window_for_utm(
+            origin, 30.0, 3660, 3660,
+            [400_000.0, -50_000.0, 450_000.0, -10_000.0],
+        );
+        assert!(west.is_none(), "AOI west of image must be empty, got {west:?}");
+        // AOI entirely NORTH of the image northing span [-109800, 0].
+        let north = cog_window_for_utm(
+            origin, 30.0, 3660, 3660,
+            [610_000.0, 50_000.0, 650_000.0, 90_000.0],
+        );
+        assert!(north.is_none(), "AOI north of image must be empty, got {north:?}");
+    }
+
+    #[test]
+    fn cog_window_overlap_stays_in_range() {
+        let origin = [600_000.0, 0.0];
+        let w = cog_window_for_utm(
+            origin, 30.0, 3660, 3660,
+            [605_000.0, -20_000.0, 620_000.0, -5_000.0],
+        )
+        .expect("overlapping AOI yields a window");
+        assert!(w.width > 0 && w.height > 0);
+        assert!(w.col_off + w.width <= 3660 && w.row_off + w.height <= 3660);
+    }
+
+    #[test]
+    fn force_north_uses_northern_zone_for_southern_aoi() {
+        // Jakarta: the standard helper picks 32748 (UTM 48S, false_northing=10e6),
+        // but HLS stores southern tiles in 32648 (UTM 48N, signed northing).
+        let bbox = [106.78, -6.22, 106.90, -6.10];
+        assert_eq!(crate::projx::utm_epsg_for_wgs84_bounds(bbox), 32748);
+        assert_eq!(crate::projx::utm_epsg_for_wgs84_bounds_north(bbox), 32648);
+        let g = GridSpec::from_wgs84_bounds_force_north(bbox, 60.0);
+        assert_eq!(g.epsg, 32648);
+        assert!(
+            g.bounds[1] < 0.0,
+            "southern AOI in the northern zone has negative northing, got {:?}",
+            g.bounds
+        );
+    }
 }

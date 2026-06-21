@@ -104,15 +104,25 @@ fn choose_grid(
     resolution: f64,
     output_crs: &str,
 ) -> anyhow::Result<GridSpec> {
+    // HLS georeferences every tile in the northern UTM zone (false_northing=0);
+    // the grid must follow suit or southern AOIs read empty. See
+    // EndpointConfig::uses_north_utm_convention.
+    let utm_grid = |bbox: [f64; 4], resolution: f64| {
+        if endpoint.uses_north_utm_convention() {
+            GridSpec::from_wgs84_bounds_force_north(bbox, resolution)
+        } else {
+            GridSpec::from_wgs84_bounds(bbox, resolution)
+        }
+    };
     match output_crs {
         "native" => {
             if endpoint.uses_modis_sinusoidal() {
                 Ok(GridSpec::from_wgs84_bounds_modis_sinu(bbox, resolution))
             } else {
-                Ok(GridSpec::from_wgs84_bounds(bbox, resolution))
+                Ok(utm_grid(bbox, resolution))
             }
         }
-        "utm" => Ok(GridSpec::from_wgs84_bounds(bbox, resolution)),
+        "utm" => Ok(utm_grid(bbox, resolution)),
         other => anyhow::bail!(
             "unsupported output_crs {other:?}; valid: native, utm"
         ),

@@ -83,6 +83,20 @@ pub fn utm_epsg_for_wgs84_bounds(bounds: [f64; 4]) -> u32 {
     if centre_lat >= 0.0 { 32600 + zone as u32 } else { 32700 + zone as u32 }
 }
 
+/// UTM EPSG forcing the NORTHERN zone (false_northing = 0) regardless of
+/// hemisphere. HLS georeferences every MGRS tile in the northern UTM zone with
+/// continuous (signed) northing across the equator — a southern HLS tile is
+/// stored as e.g. "UTM zone 48N" with negative northings, NOT zone 48S with the
+/// 10,000,000 m false northing. Grids that must align pixel-for-pixel with HLS
+/// COGs therefore have to use this convention; using 327xx for a southern AOI
+/// leaves the grid northings ~10,000,000 m off the scene origin, which empties
+/// the read window and drops every southern scene.
+pub fn utm_epsg_for_wgs84_bounds_north(bounds: [f64; 4]) -> u32 {
+    let centre_lon = (bounds[0] + bounds[2]) / 2.0;
+    let zone = (((centre_lon + 180.0) / 6.0).floor() as i32 + 1).clamp(1, 60);
+    32600 + zone as u32
+}
+
 fn with_transformer<F, R>(from: &str, to: &str, f: F) -> Result<R>
 where
     F: FnOnce(&Proj) -> R,

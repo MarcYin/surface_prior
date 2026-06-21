@@ -238,6 +238,15 @@ impl EndpointConfig {
         matches!(self.kind, EndpointKind::Modis43A4)
     }
 
+    /// True if the endpoint georeferences every tile in the NORTHERN UTM zone
+    /// (false_northing = 0, signed northing across the equator). HLS does this:
+    /// a southern tile is stored as "UTM zone NN N" with negative northings, not
+    /// zone NN S. The output grid must match, else southern-hemisphere AOIs get
+    /// a grid ~10,000,000 m off the scene origin and every scene reads empty.
+    pub fn uses_north_utm_convention(&self) -> bool {
+        matches!(self.kind, EndpointKind::Hls)
+    }
+
     /// PROJ-readable CRS string for this endpoint's source COGs. For
     /// MCD43A4 this is MODIS Sinusoidal; for S2/HLS the source CRS
     /// varies per-scene UTM zone, so we return None — the existing
