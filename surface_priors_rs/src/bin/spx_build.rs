@@ -394,6 +394,7 @@ async fn async_main() -> Result<()> {
     let band_names_out: Vec<&'static str> =
         endpoint.band_names_supported.iter().copied().collect();
     let scenes_for_fetch: Vec<bestpixel::stac::StacItem> = picks.iter().map(|p| p.scene.clone()).collect();
+    let apply_s2_offset = endpoint.applies_s2_boa_offset();
     let mut band_tasks = FuturesUnordered::new();
     for (scene_idx, scene) in scenes_for_fetch.iter().enumerate() {
         for (band_idx, band_name) in band_names_out.iter().enumerate() {
@@ -406,7 +407,7 @@ async fn async_main() -> Result<()> {
             let grid = grid.clone();
             let sem = request_semaphore.clone();
             band_tasks.push(tokio::spawn(async move {
-                let res = fetch_band(http, &scene, &asset, &grid, sem, None).await?;
+                let res = fetch_band(http, &scene, &asset, &grid, sem, None, apply_s2_offset).await?;
                 Ok::<(usize, usize, Option<Vec<u16>>), anyhow::Error>((scene_idx, band_idx, res))
             }));
         }

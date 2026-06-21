@@ -724,6 +724,7 @@ pub async fn fetch_band(
     grid: &GridSpec,
     semaphore: Arc<tokio::sync::Semaphore>,
     source_proj: Option<&str>,
+    apply_s2_boa_offset: bool,
 ) -> Result<Option<Vec<u16>>> {
     let url = match scene.assets.get(band_asset) {
         Some(u) => u.clone(),
@@ -842,8 +843,10 @@ pub async fn fetch_band(
         "fetch_band timing"
     );
     // Harmonize the Sentinel-2 N0400 BOA_ADD_OFFSET so every processing
-    // baseline shares the reflectance = DN / 10000 convention.
-    let offset = s2_boa_offset(scene);
+    // baseline shares the reflectance = DN / 10000 convention. Skipped for
+    // providers that already harmonize (see applies_s2_boa_offset); applying it
+    // to harmonized data clamps the dark visible bands to zero.
+    let offset = if apply_s2_boa_offset { s2_boa_offset(scene) } else { 0 };
     let out = if offset > 0 {
         out.into_iter().map(|v| v.saturating_sub(offset)).collect()
     } else {

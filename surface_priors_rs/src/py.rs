@@ -409,6 +409,7 @@ fn run_build(
         let grid = choose_grid(&endpoint, bbox, resolution, &output_crs)?;
         let source_proj_for_fetch =
             cross_crs_source_proj(&endpoint, &grid);
+        let apply_s2_offset = endpoint.applies_s2_boa_offset();
 
         let http = shared_http();
         let request_semaphore =
@@ -677,6 +678,7 @@ fn run_build(
                         &grid,
                         sem,
                         source_proj_for_fetch,
+                        apply_s2_offset,
                     )
                     .await?;
                     Ok::<(usize, usize, Option<Vec<u16>>), anyhow::Error>((
@@ -1221,6 +1223,7 @@ async fn compose_one_period(
     // Fetch + compose, mirroring run_build's loop.
     let t = Instant::now();
     let quality_kind = endpoint.quality_kind;
+    let apply_s2_offset = endpoint.applies_s2_boa_offset();
     let mut band_tasks = FuturesUnordered::new();
     for (scene_idx, scene) in scenes_for_fetch.iter().enumerate() {
         let read_grid = scene_grids[scene_idx].clone();
@@ -1235,7 +1238,8 @@ async fn compose_one_period(
             let sem = sem.clone();
             band_tasks.push(tokio::spawn(async move {
                 let res =
-                    fetch_band(http, &scene, &asset, &grid, sem, source_proj).await?;
+                    fetch_band(http, &scene, &asset, &grid, sem, source_proj, apply_s2_offset)
+                        .await?;
                 Ok::<(usize, usize, Option<Vec<u16>>), anyhow::Error>((
                     scene_idx, band_idx, res,
                 ))

@@ -247,6 +247,18 @@ impl EndpointConfig {
         matches!(self.kind, EndpointKind::Hls)
     }
 
+    /// Whether to subtract the Sentinel-2 N0400 `BOA_ADD_OFFSET` (+1000 DN) at
+    /// fetch (see [`crate::pipeline::s2_boa_offset`]). Providers differ:
+    /// Microsoft Planetary Computer serves RAW DN, so the offset must be
+    /// removed; Element84 Earth Search already HARMONIZES post-2022 scenes to
+    /// the `DN / 10000` scale yet keeps the `s2:processing_baseline >= 04.00`
+    /// tag, so subtracting it again clamps the dark visible bands (blue/green/
+    /// red, mostly < 1000 DN) to zero while leaving NIR/SWIR intact. Only apply
+    /// it where the data is genuinely raw.
+    pub fn applies_s2_boa_offset(&self) -> bool {
+        !matches!(self.kind, EndpointKind::EarthSearch)
+    }
+
     /// PROJ-readable CRS string for this endpoint's source COGs. For
     /// MCD43A4 this is MODIS Sinusoidal; for S2/HLS the source CRS
     /// varies per-scene UTM zone, so we return None — the existing
@@ -620,5 +632,25 @@ fn append_token(href: &str, token: &str) -> String {
         format!("{href}&{token}")
     } else {
         format!("{href}?{token}")
+    }
+}
+
+#[cfg(test)]
+mod boa_offset_tests {
+    use super::*;
+
+    #[test]
+    fn earth_search_skips_boa_offset_pc_applies() {
+        // Element84 Earth Search harmonizes S2 L2A (offset already removed) but
+        // keeps the baseline tag; applying the +1000 offset again clamps the
+        // dark visible bands to zero. PC serves raw DN and needs the offset.
+        assert!(
+            !EndpointConfig::earth_search().applies_s2_boa_offset(),
+            "earth-search S2 L2A is harmonized; BOA offset must NOT be re-applied"
+        );
+        assert!(
+            EndpointConfig::planetary_computer().applies_s2_boa_offset(),
+            "PC S2 L2A is raw DN; BOA offset must be applied"
+        );
     }
 }
