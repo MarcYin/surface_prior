@@ -16,9 +16,16 @@ retrieval:
 from __future__ import annotations
 
 import numpy as np
-
-from surface_dictionary import (ANCHOR, SOLVE, WL, SurfaceDictionary, correct,
-                                 forward, load_block, load_full)
+from surface_dictionary import (
+    ANCHOR,
+    SOLVE,
+    WL,
+    SurfaceDictionary,
+    correct,
+    forward,
+    load_block,
+    load_full,
+)
 
 RNG = np.random.default_rng(0)
 YEARS = [2020, 2021, 2022, 2023, 2024]
@@ -63,7 +70,7 @@ def main():
     for aT in (0.10, 0.30, 0.50, 0.80):
         toa = forward(rho, aT, WL) + RNG.normal(0, 0.003, rho.shape)
         row = [f"{aT:5.2f}"]
-        for lab, aa in [("TOA", None), ("c0", aT), ("c+", aT+0.1), ("c-", max(aT-0.1, 0.01)),
+        for _lab, aa in [("TOA", None), ("c0", aT), ("c+", aT+0.1), ("c-", max(aT-0.1, 0.01)),
                         ("c2", aT+0.2), ("or", aT)]:
             p = predict(toa, dic, aa)
             row.append(f"{np.sqrt(np.mean((p[:,1]-rho[:,1])**2))*1e4:6.0f}")

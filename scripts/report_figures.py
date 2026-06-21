@@ -4,6 +4,7 @@ so this just renders — no experiments re-run."""
 from __future__ import annotations
 
 import matplotlib
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np

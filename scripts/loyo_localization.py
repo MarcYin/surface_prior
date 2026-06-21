@@ -61,8 +61,10 @@ def main():
     # pre-sample every composite once: {(year,month): (N,7)}
     print("sampling 60 composites ...")
     S = {(y, m): load_sample(y, m) for y in YEARS for m in range(1, 13)}
-    A = lambda arr: arr[:, [3, 4, 5, 6]]     # anchor cols
-    V = lambda arr: arr[:, :3]               # visible targets
+    def A(arr):
+        return arr[:, [3, 4, 5, 6]]     # anchor cols
+    def V(arr):
+        return arr[:, :3]               # visible targets
 
     configs = ["global", "LOYO-Jul", "LOYO-allmonth", "same-year-rest", "all-but-target"]
     res = {c: {"coastal": [], "blue": []} for c in configs}
@@ -88,7 +90,7 @@ def main():
             res[c]["coastal"].append(np.sqrt(np.mean((pred[:, 0] - truth[:, 0])**2)) * 1e4)
             res[c]["blue"].append(np.sqrt(np.mean((pred[:, 1] - truth[:, 1])**2)) * 1e4)
 
-    print(f"\nLOYO visible-prediction RMSE (DN), mean over 5 target years (+per-year blue):")
+    print("\nLOYO visible-prediction RMSE (DN), mean over 5 target years (+per-year blue):")
     print(f"  {'config':16} {'coastal':>8} {'blue':>7}   blue per target year")
     for c in configs:
         co = np.mean(res[c]["coastal"]); bl = np.mean(res[c]["blue"])

@@ -19,9 +19,8 @@ from __future__ import annotations
 
 import numpy as np
 import rasterio
-from rasterio.windows import Window
-
 from aod_from_anchor import WL, forward, joint_predict_vis  # shared RT + joint kNN
+from rasterio.windows import Window
 
 REFL = 1e-4
 RNG = np.random.default_rng(1)
@@ -76,7 +75,7 @@ def part_b_spatial(a_g, c_g):
     with rasterio.open(HLS) as ds:
         blk = ds.read(list(range(1, 8)), window=Window(c0, r0, W, H)).astype(np.float32)
     rho = np.clip(blk.reshape(7, -1).T * REFL, 1e-4, 0.95).astype(np.float64)   # (N,7)
-    n = len(rho)
+    len(rho)
     # known AOD: smooth left->right gradient 0.15 -> 0.45
     col = np.tile(np.arange(W), H)
     aod_true = 0.15 + 0.30 * col / (W - 1)

@@ -93,7 +93,7 @@ def main():
     cumL = np.cumsum(wL) / wL.sum()
     print(f"\nB. Library PCA at 5 S2A VNIR bands ({L.shape[0]} spectra)")
     print("   cum explained var: " + "  ".join(f"k{k}={cumL[k-1]*100:.3f}%" for k in range(1, 6)))
-    print(f"   library mean refl (DN): " + " ".join(f"{n}={muL[i]*1e4:.0f}" for i, n in enumerate(NAMES)))
+    print("   library mean refl (DN): " + " ".join(f"{n}={muL[i]*1e4:.0f}" for i, n in enumerate(NAMES)))
     np.set_printoptions(precision=3, suppress=True)
     for k in range(5):
         print(f"   eigvec{k+1} ({wL[k]/wL.sum()*100:5.2f}%): {VL[:,k]}")

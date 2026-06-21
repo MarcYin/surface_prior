@@ -18,9 +18,16 @@ Report blue surface-prediction error and AOD retrieval (forward-match solve).
 from __future__ import annotations
 
 import numpy as np
-
-from surface_dictionary import (ANCHOR, SOLVE, WL, SurfaceDictionary, correct,
-                                 forward, load_block, load_full)
+from surface_dictionary import (
+    ANCHOR,
+    SOLVE,
+    WL,
+    SurfaceDictionary,
+    correct,
+    forward,
+    load_block,
+    load_full,
+)
 
 RNG = np.random.default_rng(0)
 YEARS = [2020, 2021, 2022, 2023, 2024]

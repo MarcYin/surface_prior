@@ -15,8 +15,6 @@ aerosol-sensitive bands. Compare retrieved AOD to AOT*.
 """
 from __future__ import annotations
 
-from pathlib import Path
-
 import numpy as np
 import rasterio
 from spectral_library import SpectralMapper
@@ -50,6 +48,7 @@ def predict_surface(rows, anchor_bands, k=10):
 
 # ---- custom JOINT aerosol-free kNN (red+nir+swir together inform visible) ----
 from scipy.spatial import cKDTree  # noqa: E402
+
 _C = resolve_prepared_library_root()
 _Lv = np.load(f"{_C}/source_sentinel-2a_msi_vnir.npy").astype(np.float64)   # ub,blue,green,red,nir
 _Ls = np.load(f"{_C}/source_sentinel-2a_msi_swir.npy")[:, [1, 2]].astype(np.float64)  # swir1,swir2
@@ -131,7 +130,7 @@ def run_solve_sweep(rho_s, grid):
 
     sets = {"443 only": [0], "490 only": [1], "560 only": [2],
             "443+490": [0, 1], "443+490+560": [0, 1, 2]}
-    print(f"\nAOD retrieval by solve-band set (scene / px-median):")
+    print("\nAOD retrieval by solve-band set (scene / px-median):")
     print(f"  {'solve set':14} {'AOT*=.10':>12} {'AOT*=.30':>12} {'AOT*=.50':>12}")
     for tag, S in sets.items():
         row = [f"  {tag:14}"]

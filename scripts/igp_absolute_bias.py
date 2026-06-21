@@ -21,9 +21,8 @@ import calendar
 
 import bestpixel as bp
 import numpy as np
-from scipy.spatial import cKDTree
-
 from scene_aod_gee import ES_SEARCH, init_ee, scene_aod, search_scenes
+from scipy.spatial import cKDTree
 
 CACHE = "/home/users/marcyin/.cache/spectral-library/prepared-runtime/v0.6.3"
 BANDS = ["coastal", "blue", "green", "red", "nir", "swir16", "swir22"]
@@ -64,17 +63,17 @@ def main():
     bbox = tuple(a.bbox); last = calendar.monthrange(a.year, a.month)[1]
     init_ee()
     dates = {}
-    for sid, dt in search_scenes(["sentinel-2-l2a"], bbox,
+    for _sid, dt in search_scenes(["sentinel-2-l2a"], bbox,
                                  f"{a.year}-{a.month:02d}-01/{a.year}-{a.month:02d}-{last:02d}",
                                  stac_url=ES_SEARCH):
         dates.setdefault(dt[:10], dt)
     aod = scene_aod(list(dates.items()), bbox)
 
     print(f"Absolute Sen2Cor visible bias vs AOD — {a.label}, {a.year}-{a.month:02d}")
-    print(f"  signed_bias = median(observed - library-predicted clean visible), DN")
+    print("  signed_bias = median(observed - library-predicted clean visible), DN")
     print(f"  {'date':10} {'AOD':>6} {'nvalid':>8} {'coastal':>8} {'blue':>7} {'green':>7}")
     rows = []
-    for d, t in sorted(dates.items()):
+    for d, _t in sorted(dates.items()):
         ad = aod[d]
         if ad["cams"] is None or ad["merra"] is None:
             continue

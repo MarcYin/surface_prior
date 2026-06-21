@@ -167,10 +167,9 @@ def main():
     col = np.tile(np.arange(W), H); at = 0.10 + 0.50 * col / (W - 1)
     toa = forward(rho, at[:, None], WL) + RNG.normal(0, 0.003, rho.shape)
     _, cell = solve(toa, dic, grid, (H, W), mode="prior", aod_prior=float(at.mean()))
-    cc = cell
     def stat(x): return np.sqrt(np.mean((x-at)**2)), np.mean(x-at), np.corrcoef(x, at)[0, 1]
     r0, b0, cc0 = stat(cell)
-    print(f"\nGradient 0.10->0.60 (60-cell), prior path (scene-mean AOD):")
+    print("\nGradient 0.10->0.60 (60-cell), prior path (scene-mean AOD):")
     print(f"  RMSE {r0:.3f}  bias {b0:+.3f}  corr {cc0:.2f}")
     print(f"  recovered: left {cell[col<W/4].mean():.2f} (~0.16)  right {cell[col>3*W/4].mean():.2f} (~0.54)")
 

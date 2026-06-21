@@ -95,7 +95,7 @@ def part1():
 
 def part2(truth):
     print("\n=== PART 2: closed-loop AOT recovery with kNN cost ===")
-    print(f"truth=HLS 2022 BOA, RT=compact 6S-style SS, noise=0.003 refl, k=5 dwm")
+    print("truth=HLS 2022 BOA, RT=compact 6S-style SS, noise=0.003 refl, k=5 dwm")
     wl = WL
     rho = np.clip(truth["HLS"][RNG.choice(len(truth["HLS"]), 4000, replace=False)], 1e-4, 0.95)
     grid = np.round(np.arange(0.02, 0.81, 0.04), 3)

@@ -13,13 +13,12 @@ redundancy. Runs entirely in the base env (bestpixel + scipy + library cache).
 """
 from __future__ import annotations
 
-import numpy as np
-from scipy.spatial import cKDTree
+import argparse
 
 import bestpixel as bp
+import numpy as np
 from scene_aod_gee import ES_SEARCH, init_ee, scene_aod, search_scenes  # same dir on sys.path
-
-import argparse
+from scipy.spatial import cKDTree
 
 CACHE = "/home/users/marcyin/.cache/spectral-library/prepared-runtime/v0.6.3"
 BANDS = ["coastal", "blue", "green", "red", "nir"]  # library vnir order
@@ -65,7 +64,7 @@ def main():
     last = _cal.monthrange(YEAR, a.month)[1]
     init_ee()
     dates = {}
-    for sid, dt in search_scenes(["sentinel-2-l2a"], BBOX,
+    for _sid, dt in search_scenes(["sentinel-2-l2a"], BBOX,
                                  f"{YEAR}-{a.month:02d}-01/{YEAR}-{a.month:02d}-{last:02d}",
                                  stac_url=ES_SEARCH):
         dates.setdefault(dt[:10], dt)
@@ -75,7 +74,7 @@ def main():
     print(f"  {'date':10} {'AOD':>6} {'nvalid':>8} {'fit_RMSE':>9} {'coastal':>8} {'blue':>7}  (DN)")
     MINV = a.min_valid
     rows = []
-    for d, t in sorted(dates.items()):
+    for d, _t in sorted(dates.items()):
         ad = aod[d]
         if ad["cams"] is None or ad["merra"] is None:
             continue

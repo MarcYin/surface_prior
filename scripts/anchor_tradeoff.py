@@ -98,7 +98,8 @@ def main():
               f"crossover {'AOD '+str(xo) if xo is not None else '>0.8 (red+swir always better)'}")
 
     try:
-        import matplotlib; matplotlib.use("Agg")
+        import matplotlib
+        matplotlib.use("Agg")
         import matplotlib.pyplot as plt
         fig, ax = plt.subplots(1, 3, figsize=(13, 4.2))
         for k, t in enumerate(TGTN):

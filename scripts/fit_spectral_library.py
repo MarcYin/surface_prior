@@ -83,7 +83,7 @@ def report(name, Yv, Ys, fit_v, pred_s):
     for i, bn in enumerate(bands):
         r = (Yv[:, i] - fit_v[:, i]) * 1e4
         print(f"  {bn:8} {r.mean():10.1f} {np.sqrt((r**2).mean()):10.1f}")
-    print(f"  SWIR PREDICTION (from VIS-NIR fit, bands unseen):")
+    print("  SWIR PREDICTION (from VIS-NIR fit, bands unseen):")
     print(f"  {'band':8} {'pred_bias':>10} {'pred_RMSE':>10} {'corr':>6}   (obs - pred, DN)")
     for i, bn in enumerate(["swir16", "swir22"]):
         r = (Ys[:, i] - pred_s[:, i]) * 1e4
@@ -125,7 +125,7 @@ def main():
     # head-to-head: which prior is closer to the library manifold
     saS = angle_deg(out["S2"][0], out["S2"][2])
     saH = angle_deg(out["HLS"][0], out["HLS"][2])
-    print(f"\n=== head-to-head (lower = closer to real-spectra manifold) ===")
+    print("\n=== head-to-head (lower = closer to real-spectra manifold) ===")
     print(f"  median VIS-NIR spectral angle:  S2 {np.median(saS):.2f}deg   HLS {np.median(saH):.2f}deg")
     for i, bn in enumerate(["swir16", "swir22"]):
         rS = np.sqrt((((out['S2'][1][:, i]-out['S2'][3][:, i])*1e4)**2).mean())

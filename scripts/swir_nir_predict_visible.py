@@ -81,7 +81,7 @@ def load_pixels(n=60000):
 def main():
     rho = load_pixels()
     print(f"SWIR+NIR -> visible prediction across AOD (n={len(rho)} clean pixels, 4 seasons)")
-    print(f"  per-band RMSE (DN): P=predict-vs-clean (robustness), O=observed-vs-clean (contamination)")
+    print("  per-band RMSE (DN): P=predict-vs-clean (robustness), O=observed-vs-clean (contamination)")
     print(f"  {'AOD':>5} " + " ".join(f"{n[:4]:>13}" for n in VISNAMES))
     curves = {n: {"P": [], "O": []} for n in VISNAMES}
     aods = [0.0, 0.1, 0.2, 0.4, 0.8]
@@ -97,7 +97,8 @@ def main():
         print(f"  {aT:5.2f} " + " ".join(f"{c:>13}" for c in cells))
 
     try:
-        import matplotlib; matplotlib.use("Agg")
+        import matplotlib
+        matplotlib.use("Agg")
         import matplotlib.pyplot as plt
         fig, ax = plt.subplots(2, 2, figsize=(10, 8))
         for k, n in enumerate(VISNAMES):

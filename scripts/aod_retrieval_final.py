@@ -15,8 +15,6 @@ accuracy -> can it estimate AOD, and how well?
 """
 from __future__ import annotations
 
-from pathlib import Path
-
 import numpy as np
 import rasterio
 from rasterio.windows import Window

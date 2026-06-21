@@ -82,7 +82,7 @@ def main():
                                            np.column_stack([Txy_s, Ta_s]))
 
     print(f"Predicting {TEST_MONTH} clean visible from {REF_MONTH} surface model")
-    print(f"(red+nir+swir anchor; n_train=200k n_test=50k) — RMSE vs truth (DN)")
+    print("(red+nir+swir anchor; n_train=200k n_test=50k) — RMSE vs truth (DN)")
     print(f"  {'method':22} {'coastal':>8} {'blue':>7} {'green':>7}")
     for name, P in preds.items():
         e = [np.sqrt(np.mean((P[:, j] - Ttruth[:, j])**2)) * 1e4 for j in range(3)]
