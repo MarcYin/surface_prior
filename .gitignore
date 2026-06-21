@@ -25,3 +25,6 @@ egypt_5y_prior_hls/
 .real-builds-tile-aware/
 # Local agent/editor settings
 .claude/
+egypt_monthly_5y_hls/
+spectral_aerosol_report/
+/*.png
