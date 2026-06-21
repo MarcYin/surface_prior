@@ -75,6 +75,10 @@ pub struct OverviewLevel {
     /// 1 = none, 2 = horizontal differencing. Anything else is unsupported.
     pub predictor: u16,
     pub bytes_per_sample: u32,
+    /// Declared TIFF BitsPerSample. When not a multiple of 8 (e.g. 15 for
+    /// Sentinel-2 L2A on Planetary Computer) the decompressed tile is bit-packed
+    /// and must be unpacked to `bytes_per_sample`-wide samples.
+    pub bits_per_sample: u32,
 }
 
 impl OverviewLevel {
@@ -278,12 +282,20 @@ async fn parse_cog(http: &reqwest::Client, url: &str, header: Bytes) -> Result<C
     // Int16; without this the bytes get read as UInt16 and the -9999 fill
     // (and any negative reflectance) becomes a huge positive value.
     let signed = ifd0.sample_format_code == 2;
-    let sample_format = match (ifd0.bits_per_sample, ifd0.samples_per_pixel, signed) {
-        (8, _, _) => SampleFormat::UInt8,
-        (16, _, true) => SampleFormat::Int16,
-        (16, _, false) => SampleFormat::UInt16,
-        (bps, spp, _) => {
-            return Err(anyhow!("unsupported sample shape {:?}", (bps, spp)))
+    // Match on the BYTE width (ceil(bits/8)), not the exact bit depth. Sentinel-2
+    // L2A COGs on Planetary Computer declare BitsPerSample = 15 (15-bit
+    // reflectance stored in a uint16 container; rasterio/GDAL read them as
+    // uint16). AWS / earth-search re-encode to 16. Both decode identically as
+    // 2-byte samples; SCL is 8-bit. Only reject widths that don't fit in 2 bytes.
+    let sample_format = match (ifd0.bits_per_sample.div_ceil(8).max(1), signed) {
+        (1, _) => SampleFormat::UInt8,
+        (2, true) => SampleFormat::Int16,
+        (2, false) => SampleFormat::UInt16,
+        (nbytes, _) => {
+            return Err(anyhow!(
+                "unsupported sample byte width {} (bits_per_sample={}, samples_per_pixel={})",
+                nbytes, ifd0.bits_per_sample, ifd0.samples_per_pixel
+            ))
         }
     };
 
@@ -309,7 +321,8 @@ fn ifd_to_level(ifd: &Ifd) -> OverviewLevel {
         tile_byte_counts: ifd.tile_byte_counts.clone(),
         compression: ifd.compression,
         predictor: if ifd.predictor == 0 { 1 } else { ifd.predictor },
-        bytes_per_sample: (ifd.bits_per_sample / 8).max(1),
+        bytes_per_sample: ifd.bits_per_sample.div_ceil(8).max(1),
+        bits_per_sample: ifd.bits_per_sample,
     }
 }
 
@@ -349,6 +362,7 @@ pub async fn read_tiles(
     let tile_w = level.tile_width as usize;
     let tile_h = level.tile_height as usize;
     let bps = level.bytes_per_sample as usize;
+    let bits = level.bits_per_sample;
 
     // Maximum number of bytes to "tolerate" between two tiles in a
     // merged range request. Bigger gap => fewer, larger HTTP GETs (fewer
@@ -400,6 +414,12 @@ pub async fn read_tiles(
                     }
                     let mut buf =
                         decode_tile(&raw[local_start..local_end], compression, expected_size)?;
+                    // Bit-packed samples (e.g. NBITS=15 S2 L2A on PC) decompress
+                    // to tile_w*tile_h*bits/8 bytes; unpack to bps-wide samples
+                    // before the predictor / stitch (which assume byte-aligned).
+                    if bits % 8 != 0 {
+                        buf = unpack_bits_to_samples(&buf, tile_w * tile_h, bits, bps);
+                    }
                     apply_predictor(&mut buf, predictor, tile_w, tile_h, bps)?;
                     out.push((tile.index, buf));
                 }
@@ -500,6 +520,40 @@ fn decode_tile(raw: &[u8], compression: u32, expected: usize) -> Result<Vec<u8>>
 /// inner u16 prefix-sum uses an 8-lane SIMD reduction; the u8 path is
 /// kept scalar because S2 SCL tiles are small enough that SIMD doesn't
 /// pay off after stride overhead.
+/// Unpack `n` bit-packed samples of `bits` bits each (MSB-first, TIFF default
+/// fill order, no inter-sample padding) into `bytes_per_sample`-wide
+/// little-endian samples. Used for TIFF BitsPerSample values that are not a
+/// multiple of 8 — e.g. Sentinel-2 L2A COGs on Planetary Computer store 15-bit
+/// reflectance packed (a 512x512 tile decompresses to 512*512*15/8 = 491520 B,
+/// not 524288). GDAL/rasterio unpack these to uint16; bestpixel must too.
+fn unpack_bits_to_samples(packed: &[u8], n: usize, bits: u32, bytes_per_sample: usize) -> Vec<u8> {
+    let mut out = vec![0u8; n * bytes_per_sample];
+    let mask: u32 = if bits >= 32 { u32::MAX } else { (1u32 << bits) - 1 };
+    let mut acc: u64 = 0;
+    let mut nbits: u32 = 0;
+    let mut bi = 0usize;
+    for i in 0..n {
+        while nbits < bits {
+            let byte = packed.get(bi).copied().unwrap_or(0);
+            acc = (acc << 8) | byte as u64;
+            bi += 1;
+            nbits += 8;
+        }
+        let shift = nbits - bits;
+        let v = ((acc >> shift) as u32) & mask;
+        nbits -= bits;
+        acc &= (1u64 << nbits) - 1;
+        if bytes_per_sample >= 2 {
+            let v16 = v as u16;
+            out[i * 2] = (v16 & 0xff) as u8;
+            out[i * 2 + 1] = (v16 >> 8) as u8;
+        } else {
+            out[i] = v as u8;
+        }
+    }
+    out
+}
+
 fn apply_predictor(buf: &mut [u8], predictor: u16, tile_w: usize, tile_h: usize, bps: usize) -> Result<()> {
     if predictor != 2 {
         return Ok(());
@@ -1106,4 +1160,37 @@ struct TilePlan<'a> {
     out_x: usize,
     out_y: usize,
     tile_stride: usize,
+}
+
+#[cfg(test)]
+mod bit_unpack_tests {
+    use super::*;
+
+    #[test]
+    fn unpack_4bit_nibbles() {
+        // [0x12, 0x34] -> MSB-first 4-bit samples 1, 2, 3, 4
+        assert_eq!(unpack_bits_to_samples(&[0x12, 0x34], 4, 4, 1), vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn unpack_12bit_to_u16_le() {
+        // [0xAB,0xCD,0xEF] = 24 bits = two 12-bit samples 0xABC, 0xDEF (MSB-first)
+        let out = unpack_bits_to_samples(&[0xAB, 0xCD, 0xEF], 2, 12, 2);
+        assert_eq!(out, vec![0xBC, 0x0A, 0xEF, 0x0D]); // little-endian u16
+    }
+
+    #[test]
+    fn unpack_15bit_roundtrip() {
+        // Two 15-bit S2-style samples packed MSB-first into 4 bytes (2 pad bits).
+        let vals: [u16; 2] = [0x55E6, 0x1234];
+        let mut bits: u64 = 0;
+        for &v in &vals {
+            bits = (bits << 15) | v as u64;
+        }
+        bits <<= 2; // 30 -> 32 bits
+        let packed = [(bits >> 24) as u8, (bits >> 16) as u8, (bits >> 8) as u8, bits as u8];
+        let out = unpack_bits_to_samples(&packed, 2, 15, 2);
+        let got: Vec<u16> = out.chunks(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+        assert_eq!(got, vec![0x55E6, 0x1234]);
+    }
 }
