@@ -40,8 +40,12 @@ def score_pixels(
     if sample_index is None:
         sample_score = 0.0
     else:
-        sample_score = np.where(np.isfinite(sample_index), sample_index, rules.nodata_quality)
-        sample_score = sample_score.astype("float64", copy=False) * rules.sample_index_weight
+        # Promote to float64 before the fill: the nodata sentinel (65535) does
+        # not fit sample_index's int16 dtype, and NumPy >= 2.5 raises an
+        # OverflowError when it weak-promotes the Python scalar into int16.
+        sample_float = sample_index.astype("float64", copy=False)
+        sample_score = np.where(np.isfinite(sample_float), sample_float, float(rules.nodata_quality))
+        sample_score = sample_score * rules.sample_index_weight
     score = quality_score + sample_score + float(source_order)
     return np.where(valid_mask, score, np.inf)
 
