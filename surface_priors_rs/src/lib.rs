@@ -11,6 +11,7 @@
 //!   - [`pipeline`]: scout, select_top_k, fetch_band, fetch_quality, compose.
 //!   - [`writer`]: tiled DEFLATE GeoTIFF output.
 
+pub mod atcorr;
 pub mod cog;
 pub mod disk_cache;
 pub mod endpoint;
