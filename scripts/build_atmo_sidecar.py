@@ -16,7 +16,6 @@ import datetime as dt
 import json
 
 import ee
-
 from scene_aod_gee import ES_SEARCH, search_scenes
 
 
