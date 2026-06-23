@@ -52,17 +52,6 @@ DEFAULT_S2_L2A_BANDS = (
     "s2_b12_swir2",
 )
 
-# L1C custom-AC composite: the 7 bands the 6S sidecar carries coefficients for.
-DEFAULT_S2_L1C_BANDS = (
-    "s2_b01_aerosol",
-    "s2_b02_blue",
-    "s2_b03_green",
-    "s2_b04_red",
-    "s2_b8a_nir_narrow",
-    "s2_b11_swir1",
-    "s2_b12_swir2",
-)
-
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
