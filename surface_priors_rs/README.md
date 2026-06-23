@@ -206,6 +206,48 @@ Same flag works on `build_monthly_composites`. SCL / Fmask / mandatory-
 quality stay nearest during reprojection, so categorical labels survive
 the CRS change.
 
+### Sentinel-2 L1C custom atmospheric correction
+
+`build_l1c_composite(...)` builds a **surface-reflectance** composite from
+raw L1C **top-of-atmosphere** scenes that you correct yourself with 6S,
+instead of relying on the L2A product's Sen2Cor correction. The recipe
+(validated against AERONET): use MAIAC AOD to pick the **low-aerosol days**,
+6S-correct those TOA scenes (MAIAC AOD + per-scene water vapour + geometry),
+and best-pixel composite — preferring the **lowest-AOD** clear pixel.
+
+L1C is JP2-on-requester-pays-s3 (not an HTTP COG), so this path fetches via
+Google Earth Engine — `pip install 'bestpixel[gee]'` and authenticate
+earthengine-api (service account via `GEE_SERVICE_ACCOUNT` /
+`GEE_SERVICE_ACCOUNT_KEY`, or `earthengine authenticate`). The fetch is
+Python (`ee.data.getPixels`, scout-first windowed); the per-pixel 6S
+correction runs in Rust (`bestpixel.correct_toa`).
+
+It needs a per-scene **atmosphere sidecar** (MAIAC AOD + water vapour +
+geometry → 6S coefficients over a TCWV LUT), built by the scripts under
+`scripts/` (GEE + SIAC native 6S); see `scripts/run_l1c_composite.sh`.
+
+```python
+import bestpixel as bp
+
+out = bp.build_l1c_composite(
+    bbox=(31.0, 29.9, 31.5, 30.3),       # WGS84 W,S,E,N
+    datetime=("2022-07-01", "2022-08-01"),
+    sidecar="cairo_sidecar.json",        # 6S coefficients per scene
+    resolution=60,
+    low_aod_frac=0.6,                    # keep the cleanest 60% of days
+    rank="aod",                          # lowest-AOD clear pixel wins (cs tie-break)
+    out="cairo_l1c.tif",                 # optional scaled int16 GeoTIFF
+)
+blue = out["bands"]["blue"]              # (H, W) surface reflectance
+print(out["scenes"], out["grid"]["epsg"])
+```
+
+Returns `{"bands": {name: (H,W) float32}, "grid": {...}, "count": (H,W),
+"scenes": [...]}`. Bands are the seven the sidecar carries coefficients for
+(`coastal, blue, green, red, nir08, swir16, swir22`). Ranking by AOD (rather
+than Cloud Score+, which saturates near 1.0 on clear pixels) keeps the result
+deterministic and picks the most reliably-corrected day.
+
 ## Use from the command line
 
 The crate also produces a native binary that writes tiled

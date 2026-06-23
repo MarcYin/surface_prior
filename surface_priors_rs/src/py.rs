@@ -15,8 +15,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
-use ndarray::Array2;
-use numpy::IntoPyArray;
+use ndarray::{Array2, Array3};
+use numpy::{IntoPyArray, PyArray3, PyReadonlyArray3};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
@@ -1443,6 +1443,50 @@ fn encode_period_results(
     Ok(out)
 }
 
+/// Apply the 6S surface-reflectance correction to a TOA reflectance stack,
+/// using the crate's `atcorr` core. `toa` is `[band, H, W]` reflectance (0..1);
+/// `xap`/`xbp`/`xcp` are one coefficient per band (already interpolated to the
+/// scene's water vapour by the caller). Returns the corrected surface
+/// reflectance stack: negatives clamp to 0, non-finite (nodata) passes through.
+///
+/// This is the L1C custom-AC composite's per-pixel correction — exposed so the
+/// Python pipeline in `bestpixel/l1c.py` runs it in Rust rather than numpy.
+#[pyfunction]
+fn correct_toa<'py>(
+    py: Python<'py>,
+    toa: PyReadonlyArray3<'py, f32>,
+    xap: Vec<f32>,
+    xbp: Vec<f32>,
+    xcp: Vec<f32>,
+) -> PyResult<Bound<'py, PyArray3<f32>>> {
+    let arr = toa.as_array();
+    let shape = arr.shape();
+    let (nb, h, w) = (shape[0], shape[1], shape[2]);
+    if xap.len() != nb || xbp.len() != nb || xcp.len() != nb {
+        return Err(PyRuntimeError::new_err(format!(
+            "coeff lengths xap={} xbp={} xcp={} must equal band count {nb}",
+            xap.len(),
+            xbp.len(),
+            xcp.len()
+        )));
+    }
+    let mut out = Array3::<f32>::zeros((nb, h, w));
+    for b in 0..nb {
+        let (a, bb, c) = (xap[b], xbp[b], xcp[b]);
+        for i in 0..h {
+            for j in 0..w {
+                let t = arr[[b, i, j]];
+                out[[b, i, j]] = if t.is_finite() {
+                    crate::atcorr::correct_refl(t, a, bb, c).max(0.0)
+                } else {
+                    f32::NAN
+                };
+            }
+        }
+    }
+    Ok(out.into_pyarray_bound(py))
+}
+
 #[pymodule]
 fn bestpixel(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Opt-in tracing to stderr when RUST_LOG is set (e.g.
@@ -1454,5 +1498,6 @@ fn bestpixel(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
         .try_init();
     m.add_function(wrap_pyfunction!(build_composite, m)?)?;
     m.add_function(wrap_pyfunction!(build_monthly_composites, m)?)?;
+    m.add_function(wrap_pyfunction!(correct_toa, m)?)?;
     Ok(())
 }
