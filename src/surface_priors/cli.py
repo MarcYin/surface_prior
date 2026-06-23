@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Optional, Sequence
 
 from surface_priors import __version__
+from surface_priors.atmosphere import AtmoSidecar
 from surface_priors.persistence import stac_item_path
 from surface_priors.provider import Provider, ProviderConfig
 from surface_priors.selection import SelectionPolicy
@@ -20,9 +21,15 @@ from surface_priors.sources.s2 import (
     DEFAULT_SCOUT_FACTOR,
 )
 from surface_priors.sources.s2_gee import S2L2AGeeSource
+from surface_priors.sources.s2_l1c_gee import S2L1CGeeSource
 from surface_priors.sources.stac_api import StacApiSource
 from surface_priors.temporal import temporal_ranges_name
-from surface_priors.types import DEFAULT_BANDS, DEFAULT_NATIVE_CRS, DEFAULT_S2_L2A_BANDS
+from surface_priors.types import (
+    DEFAULT_BANDS,
+    DEFAULT_NATIVE_CRS,
+    DEFAULT_S2_L1C_BANDS,
+    DEFAULT_S2_L2A_BANDS,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -50,9 +57,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
     build.add_argument(
         "--gee-product",
-        choices=("mcd43a1", "s2_l2a"),
+        choices=("mcd43a1", "s2_l2a", "s2_l1c"),
         default=None,
-        help="Google Earth Engine product preset. s2_l2a uses the chunked Cloud Score+ source.",
+        help=(
+            "Google Earth Engine product preset. s2_l2a uses the chunked Cloud Score+ "
+            "source; s2_l1c custom-AC-corrects L1C TOA with a 6S sidecar "
+            "(requires --atmosphere-sidecar)."
+        ),
+    )
+    build.add_argument(
+        "--atmosphere-sidecar",
+        default=None,
+        help="Path to the 6S atmosphere sidecar JSON for --gee-product s2_l1c.",
+    )
+    build.add_argument(
+        "--low-aod-frac",
+        type=float,
+        default=0.6,
+        help="s2_l1c: keep the lowest-AOD fraction of sidecar scenes as clean-day candidates.",
     )
     build.add_argument(
         "--gee-collection-id",
@@ -303,6 +325,19 @@ def _provider_config(args: argparse.Namespace) -> ProviderConfig:
                 scout_factor=args.s2_scout_factor,
                 chunk_size=args.chunk_size,
             )
+        elif args.gee_product == "s2_l1c":
+            if not args.atmosphere_sidecar:
+                raise SystemExit("--gee-product s2_l1c requires --atmosphere-sidecar PATH.")
+            source = S2L1CGeeSource(
+                temporal_ranges=tuple(tuple(value) for value in args.temporal_range),
+                atmosphere=AtmoSidecar.load(args.atmosphere_sidecar),
+                low_aod_frac=args.low_aod_frac,
+                sample_every_days=args.sample_every_days,
+                score_band=args.s2_score_band,
+                clear_threshold=args.s2_clear_threshold,
+                scout_factor=args.s2_scout_factor,
+                chunk_size=args.chunk_size,
+            )
         elif args.gee_product:
             source = EdownGeeSource.for_product(
                 args.gee_product,
@@ -381,6 +416,8 @@ def _provider_config(args: argparse.Namespace) -> ProviderConfig:
 
 
 def _default_bands_for(args: argparse.Namespace) -> Sequence[str]:
+    if getattr(args, "gee_product", None) == "s2_l1c":
+        return DEFAULT_S2_L1C_BANDS
     if getattr(args, "gee_product", None) == "s2_l2a":
         return DEFAULT_S2_L2A_BANDS
     if getattr(args, "stac_source", None):
