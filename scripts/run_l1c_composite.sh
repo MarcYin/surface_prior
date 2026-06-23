@@ -3,16 +3,16 @@
 #   MAIAC-select low-aerosol days -> GEE L1C TOA + Cloud Score+ -> 6S-correct -> best-pixel composite.
 #
 # Stages 1-3 build the per-scene atmosphere sidecar (MAIAC AOD + WVP + geometry -> 6S coeffs).
-# Stage 4 is now the productionised package: the `surface-priors` CLI drives the
-# S2L1CGeeSource (getPixels TOA + 6S correction + Cloud Score+ best-pixel) through
-# the scout/select/windowed-fetch/compositor machinery and writes per-band GeoTIFFs.
+# Stage 4 is the productionised package: bestpixel.build_l1c_composite (getPixels TOA +
+# Rust 6S correction + Cloud Score+ best-pixel) writes a per-band GeoTIFF.
+# Requires `pip install 'bestpixel[gee]'`.
 #
 #   export GEE_SERVICE_ACCOUNT=python-gee@gee-marc.iam.gserviceaccount.com
 #   export GEE_SERVICE_ACCOUNT_KEY=/home/users/marcyin/gee-service-account.json
-#   scripts/run_l1c_composite.sh 31.0 29.9 31.5 30.3 2022-07-01 2022-08-01 /tmp/l1c_cairo /tmp/l1c_cache
+#   scripts/run_l1c_composite.sh 31.0 29.9 31.5 30.3 2022-07-01 2022-08-01 /tmp/l1c_cairo /tmp/l1c_cairo.tif
 set -euo pipefail
 
-X0=$1 Y0=$2 X1=$3 Y1=$4 M0=$5 M1=$6 SIDECAR_BASE=$7 CACHE=$8
+X0=$1 Y0=$2 X1=$3 Y1=$4 M0=$5 M1=$6 SIDECAR_BASE=$7 OUT=$8
 FRAC=${9:-0.6}; RES=${10:-60}
 BASE=/home/users/marcyin/.pixi/envs/base/bin/python
 RT6S=/home/users/marcyin/SIAC/.pixi/envs/rt6s/bin/python
@@ -29,9 +29,17 @@ echo "== 3/4 merge -> AtmoSidecar JSON =="
 $BASE "$SD/atmo_sidecar_merge.py" --meta "${SIDECAR_BASE}_meta.json" \
   --coeffs "${SIDECAR_BASE}_coeffs.npz" --out "${SIDECAR_BASE}_sidecar.json"
 
-echo "== 4/4 productionised composite (surface-priors CLI, S2L1CGeeSource) =="
-$BASE -m surface_priors.cli build \
-  --product-id "l1c-$(basename "$SIDECAR_BASE")" --wgs84-bounds "$X0" "$Y0" "$X1" "$Y1" --resolution "$RES" \
-  --gee-product s2_l1c --atmosphere-sidecar "${SIDECAR_BASE}_sidecar.json" --low-aod-frac "$FRAC" \
-  --temporal-range "$M0" "$M1" --composite-period "${M0:0:7}" --cache-dir "$CACHE"
-echo "done -> per-band GeoTIFFs under $CACHE"
+echo "== 4/4 composite (bestpixel.build_l1c_composite) =="
+SIDECAR="${SIDECAR_BASE}_sidecar.json" BBOX_X0="$X0" BBOX_Y0="$Y0" BBOX_X1="$X1" BBOX_Y1="$Y1" \
+MONTH0="$M0" MONTH1="$M1" FRAC="$FRAC" RES="$RES" OUT="$OUT" $BASE - <<'PY'
+import os
+import bestpixel as bp
+out = bp.build_l1c_composite(
+    bbox=(float(os.environ["BBOX_X0"]), float(os.environ["BBOX_Y0"]),
+          float(os.environ["BBOX_X1"]), float(os.environ["BBOX_Y1"])),
+    datetime=(os.environ["MONTH0"], os.environ["MONTH1"]),
+    sidecar=os.environ["SIDECAR"], resolution=float(os.environ["RES"]),
+    low_aod_frac=float(os.environ["FRAC"]), out=os.environ["OUT"])
+print(f"used {len(out['scenes'])} scenes -> {out.get('path')}")
+PY
+echo "done -> $OUT"
