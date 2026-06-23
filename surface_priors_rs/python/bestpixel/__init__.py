@@ -48,6 +48,10 @@ _ensure_proj_data()
 from . import bestpixel as _core  # noqa: E402  (compiled extension)
 from .bestpixel import *  # noqa: E402,F401,F403
 
+# Pure-Python L1C custom-AC composite (GEE fetch + the Rust correct_toa core).
+# The module only pulls in earthengine-api/rasterio when build_l1c_composite
+# is actually called, so importing bestpixel never needs the 'gee' extra.
+from .l1c import build_l1c_composite  # noqa: E402,F401
+
 __doc__ = _core.__doc__
-if hasattr(_core, "__all__"):
-    __all__ = _core.__all__
+__all__ = list(getattr(_core, "__all__", [])) + ["build_l1c_composite"]

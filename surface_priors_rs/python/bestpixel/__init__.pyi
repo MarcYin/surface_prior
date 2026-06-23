@@ -73,3 +73,52 @@ def build_monthly_composites(
     ``month``. All selection/fetch params behave as in :func:`build_composite`.
     """
     ...
+
+def correct_toa(
+    toa: Any,
+    xap: Sequence[float],
+    xbp: Sequence[float],
+    xcp: Sequence[float],
+) -> Any:
+    """6S-correct a TOA reflectance stack to surface reflectance (Rust core).
+
+    ``toa`` is a ``(band, H, W)`` float32 numpy array of TOA reflectance (0..1);
+    ``xap``/``xbp``/``xcp`` give one 6S coefficient per band (already
+    interpolated to the scene's water vapour). Returns a ``(band, H, W)`` float32
+    array: ``rho_boa = y / (1 + xcp*y)``, ``y = xap*rho_toa - xbp``; negatives
+    clamp to 0, non-finite (nodata) passes through.
+    """
+    ...
+
+def build_l1c_composite(
+    bbox: Sequence[float],
+    datetime: tuple[str, str],
+    sidecar: str,
+    *,
+    resolution: float = 60.0,
+    epsg: Optional[int] = None,
+    bands: Optional[Sequence[str]] = None,
+    low_aod_frac: float = 0.6,
+    cs_thresh: float = 0.6,
+    rank: str = "aod",
+    chunk: int = 1024,
+    scout_factor: int = 8,
+    coverage_target: float = 0.98,
+    min_k: int = 2,
+    max_k: int = 8,
+    workers: int = 16,
+    out: Optional[str] = None,
+    ee_module: Optional[Any] = None,
+) -> dict[str, Any]:
+    """Sentinel-2 L1C custom-AC monthly composite (requires the ``gee`` extra).
+
+    MAIAC-selects the lowest-AOD ``low_aod_frac`` of the sidecar's clean days,
+    scout-first fetches raw L1C TOA + Cloud Score+ from GEE (only the patches
+    that win a chunk), 6S-corrects each scene via :func:`correct_toa`, and
+    best-pixel composites preferring the lowest-AOD clear pixel
+    (``rank="aod"``; ``cs`` tie-break) or the clearest (``rank="cs"``).
+
+    Returns ``{"bands": {name: (H,W) float32}, "grid": {...}, "count": (H,W),
+    "scenes": [...]}`` and, when ``out`` is given, writes a scaled int16 GeoTIFF.
+    """
+    ...
