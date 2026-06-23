@@ -5,6 +5,7 @@ from surface_priors.chunks import ChunkLayout
 from surface_priors.sources.s2 import (
     NODATA_QUALITY,
     aggregate_chunk_stats,
+    aod_cloud_score_to_quality,
     apply_zero_as_nodata,
     cloud_score_to_quality,
     cloud_score_valid_mask,
@@ -13,6 +14,25 @@ from surface_priors.sources.s2 import (
     scl_valid_mask,
 )
 from surface_priors.types import GridSpec
+
+
+def test_aod_quality_prefers_low_aod_then_clear():
+    score = np.array([[1.0, 0.7]], dtype="float32")
+    clean = aod_cloud_score_to_quality(score, aod=0.10)
+    hazy = aod_cloud_score_to_quality(score, aod=0.30)
+    # every clear pixel of the low-AOD scene outranks (lower quality than) the
+    # high-AOD scene, regardless of per-pixel cs
+    assert clean.max() < hazy.min()
+    # within one scene, clearer cs breaks the tie (lower quality)
+    assert clean[0, 0] < clean[0, 1]
+    assert clean.dtype == np.uint16
+
+
+def test_aod_quality_gates_cloud_as_nodata():
+    score = np.array([0.8, 0.4, np.nan], dtype="float32")
+    q = aod_cloud_score_to_quality(score, aod=0.1, clear_threshold=0.6)
+    assert q[0] < NODATA_QUALITY
+    assert q[1] == NODATA_QUALITY and q[2] == NODATA_QUALITY
 
 
 def test_cloud_score_to_quality_inverts_score():

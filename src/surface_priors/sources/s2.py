@@ -15,6 +15,7 @@ from surface_priors.chunks import ChunkLayout
 from surface_priors.selection import SceneChunkStats
 
 S2_L2A_COLLECTION_ID = "COPERNICUS/S2_SR_HARMONIZED"
+S2_L1C_COLLECTION_ID = "COPERNICUS/S2_HARMONIZED"
 CLOUD_SCORE_PLUS_COLLECTION_ID = "GOOGLE/CLOUD_SCORE_PLUS/V1/S2_HARMONIZED"
 
 S2_L2A_BAND_MAP: Mapping[str, str] = {
@@ -31,6 +32,24 @@ S2_L2A_BAND_MAP: Mapping[str, str] = {
     "s2_b11_swir1": "B11",
     "s2_b12_swir2": "B12",
 }
+
+# L1C TOA composite: the 7 bands the 6S sidecar carries coefficients for, mapping
+# the package band name -> (GEE L1C band id, sidecar/6S band key).
+S2_L1C_BANDS: Mapping[str, Tuple[str, str]] = {
+    "s2_b01_aerosol": ("B1", "coastal"),
+    "s2_b02_blue": ("B2", "blue"),
+    "s2_b03_green": ("B3", "green"),
+    "s2_b04_red": ("B4", "red"),
+    "s2_b8a_nir_narrow": ("B8A", "nir08"),
+    "s2_b11_swir1": ("B11", "swir16"),
+    "s2_b12_swir2": ("B12", "swir22"),
+}
+S2_TOA_SCALE = 0.0001   # S2_HARMONIZED DN -> TOA reflectance
+
+# AOD-priority quality packing (see aod_cloud_score_to_quality): primary key is
+# AOD (lower wins), cs is the fine tie-break. uint16 stays < NODATA_QUALITY.
+AOD_QUALITY_SCALE = 200.0   # AOD 0..~1.25 -> 0..250 high-order
+AOD_QUALITY_STRIDE = 200    # cs tie-break occupies 0..199 low-order
 
 DEFAULT_SCORE_BAND = "cs"
 DEFAULT_CLEAR_THRESHOLD = 0.0
@@ -72,6 +91,35 @@ def cloud_score_valid_mask(score: np.ndarray) -> np.ndarray:
 
     score = np.asarray(score)
     return np.isfinite(score) & (score >= 0.0) & (score <= 1.0)
+
+
+def aod_cloud_score_to_quality(
+    score: np.ndarray,
+    *,
+    aod: float,
+    clear_threshold: float = DEFAULT_CLEAR_THRESHOLD,
+) -> np.ndarray:
+    """Quality for the L1C custom-AC composite: gate on Cloud Score+, then rank
+    clear pixels by LOWEST MAIAC AOD (most reliable 6S correction), with `cs` as
+    a deterministic tie-break.
+
+    Cloud Score+ saturates near 1.0 for clear pixels, so the bare-cs argmax is a
+    near-arbitrary coin-flip between equally-clear days. Packing AOD (per-scene
+    scalar) into the high-order part of the uint16 quality and `cs` into the
+    low-order part makes the existing lowest-score-wins compositor prefer the
+    low-aerosol day and stay deterministic regardless of fetch order. Cloudy,
+    NaN, or out-of-range pixels become the package-wide nodata sentinel.
+    """
+
+    score = np.asarray(score, dtype="float32")
+    quality = np.full(score.shape, NODATA_QUALITY, dtype="uint16")
+    valid = np.isfinite(score) & (score >= float(clear_threshold)) & (score <= 1.0)
+    if np.any(valid):
+        aod_part = int(np.clip(round(float(aod) * AOD_QUALITY_SCALE), 0, 250))
+        cs_part = np.clip(np.rint((1.0 - score[valid]) * (AOD_QUALITY_STRIDE - 1)), 0, AOD_QUALITY_STRIDE - 1)
+        packed = aod_part * AOD_QUALITY_STRIDE + cs_part
+        quality[valid] = np.clip(packed, 0, NODATA_QUALITY - 1).astype("uint16", copy=False)
+    return quality
 
 
 def scl_to_quality(scl: np.ndarray) -> np.ndarray:
