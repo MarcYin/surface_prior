@@ -129,15 +129,24 @@ fn choose_grid(
     }
 }
 
-/// If the endpoint's source CRS differs from the grid CRS, return
-/// the source CRS so the fetch path can reproject; otherwise None.
-fn cross_crs_source_proj(
-    endpoint: &EndpointConfig,
-    grid: &GridSpec,
-) -> Option<&'static str> {
-    endpoint
-        .source_proj()
-        .filter(|sp| *sp != grid.proj_def().as_str())
+/// The native source CRS of one scene's COGs, used by scout/fetch to decide
+/// whether (and from where) to reproject onto the AOI grid.
+///
+/// MODIS is a single sinusoidal grid shared by every scene. S2/HLS COGs each
+/// sit in their own UTM zone, so the CRS is derived *per scene* from its MGRS
+/// tile — the fix for AOIs on a 6° UTM seam: the grid is one zone but scenes
+/// arrive from both, and a single shared source CRS made the neighbouring
+/// zone's tiles read in the wrong zone (empty window → 0 usable → dropped,
+/// so `n_src=0`). scout_scene/fetch_band still no-op the reprojection when a
+/// scene's zone equals the grid zone (`source_proj == grid_proj`), so
+/// single-zone AOIs are byte-for-byte unchanged. Returns None only when the
+/// tile code is absent/unparseable, restoring the legacy same-CRS path.
+fn scene_source_proj(endpoint: &EndpointConfig, scene: &crate::stac::StacItem) -> Option<String> {
+    if let Some(sp) = endpoint.source_proj() {
+        return Some(sp.to_string());
+    }
+    crate::projx::epsg_from_mgrs_tile(&scene.mgrs_tile, endpoint.uses_north_utm_convention())
+        .map(|e| format!("EPSG:{e}"))
 }
 use crate::grid::GridSpec;
 use crate::pipeline::{
@@ -407,8 +416,6 @@ fn run_build(
         // process — see shared_endpoint() / shared_http().
         let endpoint = shared_endpoint(endpoint_kind);
         let grid = choose_grid(&endpoint, bbox, resolution, &output_crs)?;
-        let source_proj_for_fetch =
-            cross_crs_source_proj(&endpoint, &grid);
         let apply_s2_offset = endpoint.applies_s2_boa_offset();
 
         let http = shared_http();
@@ -519,6 +526,7 @@ fn run_build(
                     continue;
                 }
             };
+            let scene_src = scene_source_proj(&endpoint, &item);
             tasks.push(tokio::spawn(async move {
                 scout_scene(
                     http,
@@ -528,7 +536,7 @@ fn run_build(
                     sem,
                     &quality_asset,
                     quality_kind,
-                    source_proj_for_fetch,
+                    scene_src.as_deref(),
                 )
                 .await
             }));
@@ -653,6 +661,7 @@ fn run_build(
         let mut band_tasks = FuturesUnordered::new();
         for (scene_idx, scene) in scenes_for_fetch.iter().enumerate() {
             let read_grid = scene_grids[scene_idx].clone();
+            let scene_src = scene_source_proj(&endpoint, scene);
             for (band_idx, band_name) in band_names_out.iter().enumerate() {
                 // Per-scene asset resolution: HLS L30 and S30 use the
                 // same stable band name but different asset keys.
@@ -670,6 +679,7 @@ fn run_build(
                 let http = http.clone();
                 let grid = read_grid.clone();
                 let sem = request_semaphore.clone();
+                let scene_src = scene_src.clone();
                 band_tasks.push(tokio::spawn(async move {
                     let res = fetch_band(
                         http,
@@ -677,7 +687,7 @@ fn run_build(
                         &asset,
                         &grid,
                         sem,
-                        source_proj_for_fetch,
+                        scene_src.as_deref(),
                         apply_s2_offset,
                     )
                     .await?;
@@ -699,6 +709,7 @@ fn run_build(
             let http = http.clone();
             let grid = read_grid.clone();
             let sem = request_semaphore.clone();
+            let scene_src = scene_src.clone();
             band_tasks.push(tokio::spawn(async move {
                 let res = fetch_quality(
                     http,
@@ -707,7 +718,7 @@ fn run_build(
                     sem,
                     &quality_asset,
                     quality_kind,
-                    source_proj_for_fetch,
+                    scene_src.as_deref(),
                 )
                 .await?;
                 Ok::<(usize, usize, Option<Vec<u16>>), anyhow::Error>((
@@ -868,7 +879,6 @@ fn run_build_periods(
         };
         let endpoint = shared_endpoint(endpoint_kind);
         let grid = choose_grid(&endpoint, bbox, resolution, &output_crs)?;
-        let source_proj_for_fetch = cross_crs_source_proj(&endpoint, &grid);
 
         let http = shared_http();
         let request_semaphore =
@@ -1001,6 +1011,7 @@ fn run_build_periods(
                 Some(a) => a.to_string(),
                 None => continue,
             };
+            let scene_src = scene_source_proj(&endpoint, &item);
             scout_tasks.push(tokio::spawn(async move {
                 scout_scene(
                     http,
@@ -1010,7 +1021,7 @@ fn run_build_periods(
                     sem,
                     &quality_asset,
                     quality_kind,
-                    source_proj_for_fetch,
+                    scene_src.as_deref(),
                 )
                 .await
             }));
@@ -1096,7 +1107,6 @@ fn run_build_periods(
                 request_semaphore.clone(),
                 band_names_arc.as_ref(),
                 sel,
-                source_proj_for_fetch,
             )
             .await
             {
@@ -1146,7 +1156,6 @@ async fn compose_one_period(
     sem: Arc<tokio::sync::Semaphore>,
     band_names_out: &[String],
     sel: SelectParams,
-    source_proj: Option<&'static str>,
 ) -> anyhow::Result<BuildResult> {
     use futures::stream::{FuturesUnordered, StreamExt};
     use std::time::Instant;
@@ -1227,6 +1236,7 @@ async fn compose_one_period(
     let mut band_tasks = FuturesUnordered::new();
     for (scene_idx, scene) in scenes_for_fetch.iter().enumerate() {
         let read_grid = scene_grids[scene_idx].clone();
+        let scene_src = scene_source_proj(endpoint, scene);
         for (band_idx, band_name) in band_names_out.iter().enumerate() {
             let Some(asset) = endpoint.asset_for(&scene.collection, band_name) else {
                 continue;
@@ -1236,9 +1246,10 @@ async fn compose_one_period(
             let http = http.clone();
             let grid = read_grid.clone();
             let sem = sem.clone();
+            let scene_src = scene_src.clone();
             band_tasks.push(tokio::spawn(async move {
                 let res =
-                    fetch_band(http, &scene, &asset, &grid, sem, source_proj, apply_s2_offset)
+                    fetch_band(http, &scene, &asset, &grid, sem, scene_src.as_deref(), apply_s2_offset)
                         .await?;
                 Ok::<(usize, usize, Option<Vec<u16>>), anyhow::Error>((
                     scene_idx, band_idx, res,
@@ -1253,6 +1264,7 @@ async fn compose_one_period(
         let http = http.clone();
         let grid = read_grid.clone();
         let sem = sem.clone();
+        let scene_src = scene_src.clone();
         band_tasks.push(tokio::spawn(async move {
             let res = fetch_quality(
                 http,
@@ -1261,7 +1273,7 @@ async fn compose_one_period(
                 sem,
                 &quality_asset,
                 quality_kind,
-                source_proj,
+                scene_src.as_deref(),
             )
             .await?;
             Ok::<(usize, usize, Option<Vec<u16>>), anyhow::Error>((

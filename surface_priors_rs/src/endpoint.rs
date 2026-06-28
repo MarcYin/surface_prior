@@ -259,11 +259,13 @@ impl EndpointConfig {
         !matches!(self.kind, EndpointKind::EarthSearch)
     }
 
-    /// PROJ-readable CRS string for this endpoint's source COGs. For
-    /// MCD43A4 this is MODIS Sinusoidal; for S2/HLS the source CRS
-    /// varies per-scene UTM zone, so we return None — the existing
-    /// same-CRS resampler handles those because the pipeline picks
-    /// the target UTM zone to match the AOI.
+    /// PROJ-readable CRS string for this endpoint's source COGs when it is a
+    /// *single* CRS shared by every scene — MCD43A4's MODIS Sinusoidal. S2/HLS
+    /// COGs each sit in their own UTM zone, which is not a constant, so this
+    /// returns None and the per-scene CRS is derived from the MGRS tile in
+    /// `scene_source_proj` (see py.rs). That per-scene derivation is what lets
+    /// an AOI straddling a UTM seam reproject the neighbouring zone's tiles
+    /// instead of reading them in the grid's zone and scoring them 0-usable.
     pub fn source_proj(&self) -> Option<&'static str> {
         match self.kind {
             EndpointKind::Modis43A4 => Some(crate::grid::MODIS_SINU_PROJ4),

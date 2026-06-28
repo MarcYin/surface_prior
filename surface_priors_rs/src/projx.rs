@@ -97,6 +97,35 @@ pub fn utm_epsg_for_wgs84_bounds_north(bounds: [f64; 4]) -> u32 {
     32600 + zone as u32
 }
 
+/// UTM EPSG of an MGRS tile's own COG, from the tile code (`"16TCN"` →
+/// zone 16, band `T` → northern → 32616). This is the *scene's* native
+/// CRS, which is NOT necessarily the AOI grid's zone: an AOI straddling a
+/// 6° UTM seam pulls tiles from the neighbouring zone too, and those COGs
+/// live in that zone. Deriving the source CRS per scene (rather than
+/// assuming every scene shares the grid zone) lets the seam tiles be
+/// reprojected instead of read in the wrong zone and scored 0-usable.
+///
+/// `force_north` mirrors [`utm_epsg_for_wgs84_bounds_north`]: HLS stores every
+/// tile in the northern zone (continuous signed northing), so its COGs are
+/// always 326xx regardless of hemisphere; S2/PC use the true hemisphere from
+/// the MGRS latitude band (`C`–`M` south → 327xx, `N`–`X` north → 326xx).
+pub fn epsg_from_mgrs_tile(tile: &str, force_north: bool) -> Option<u32> {
+    let b = tile.as_bytes();
+    if b.len() < 3 {
+        return None;
+    }
+    let zone: u32 = std::str::from_utf8(&b[0..2]).ok()?.parse().ok()?;
+    if !(1..=60).contains(&zone) {
+        return None;
+    }
+    let band = b[2].to_ascii_uppercase();
+    if !band.is_ascii_alphabetic() {
+        return None;
+    }
+    let north = force_north || band >= b'N'; // MGRS bands C..M south, N..X north
+    Some(if north { 32600 + zone } else { 32700 + zone })
+}
+
 fn with_transformer<F, R>(from: &str, to: &str, f: F) -> Result<R>
 where
     F: FnOnce(&Proj) -> R,
@@ -128,4 +157,27 @@ pub fn snap_bounds(bounds: [f64; 4], resolution: f64) -> [f64; 4] {
         (bounds[2] / r).ceil() * r,
         (bounds[3] / r).ceil() * r,
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mgrs_tile_to_utm_epsg() {
+        // Northern-hemisphere tiles (band >= N): 326xx. These are the three
+        // AERONET seam sites whose neighbouring-zone tiles were being dropped.
+        assert_eq!(epsg_from_mgrs_tile("16TCN", false), Some(32616)); // Wisconsin
+        assert_eq!(epsg_from_mgrs_tile("15TYH", false), Some(32615)); // its seam neighbour
+        assert_eq!(epsg_from_mgrs_tile("17TKE", false), Some(32617)); // Dayton
+        assert_eq!(epsg_from_mgrs_tile("35SKC", false), Some(32635)); // Athens
+        assert_eq!(epsg_from_mgrs_tile("33TVF", false), Some(32633)); // Napoli control
+        // Southern-hemisphere band (C..M): 327xx unless force_north.
+        assert_eq!(epsg_from_mgrs_tile("48MYT", false), Some(32748));
+        assert_eq!(epsg_from_mgrs_tile("48MYT", true), Some(32648)); // HLS north convention
+        // Garbage / short input → None (falls back to legacy same-CRS path).
+        assert_eq!(epsg_from_mgrs_tile("", false), None);
+        assert_eq!(epsg_from_mgrs_tile("XX", false), None);
+        assert_eq!(epsg_from_mgrs_tile("99TCN", false), None); // zone out of range
+    }
 }
