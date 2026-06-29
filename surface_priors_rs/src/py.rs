@@ -225,6 +225,9 @@ fn build_composite(
     min_k = 2,
     max_k = 8,
     windowed_fetch = false,
+    aod_by_day = None,
+    aod_max = None,
+    reject_unknown = false,
 ))]
 #[allow(clippy::too_many_arguments)]
 fn build_monthly_composites(
@@ -245,6 +248,14 @@ fn build_monthly_composites(
     min_k: usize,
     max_k: usize,
     windowed_fetch: bool,
+    // Optional MAIAC-style aerosol pre-filter: keyed by "YYYY-MM-DD" acquisition
+    // day -> AOD. Scenes whose day exceeds `aod_max` are dropped before
+    // fetch+compose, so the composite is built only from low-AOD days.
+    aod_by_day: Option<HashMap<String, f64>>,
+    aod_max: Option<f64>,
+    // When the gate is active, also drop scenes whose day is ABSENT from
+    // `aod_by_day` (default false = keep unknown days).
+    reject_unknown: bool,
 ) -> PyResult<Bound<'_, PyList>> {
     if years.is_empty() {
         return Err(PyRuntimeError::new_err("years must be non-empty"));
@@ -264,7 +275,8 @@ fn build_monthly_composites(
         .allow_threads(|| {
             run_build_periods(
                 bbox, years, months, resolution, sel, max_cloud_cover, concurrency,
-                endpoint, disk_cache, scout_factor, bands, output_crs,
+                endpoint, disk_cache, scout_factor, bands, output_crs, aod_by_day, aod_max,
+                reject_unknown,
             )
         })
         .map_err(|e| PyRuntimeError::new_err(format!("{e:#}")))?;
@@ -843,6 +855,9 @@ fn run_build_periods(
     scout_factor: u32,
     bands_subset: Option<Vec<String>>,
     output_crs: String,
+    aod_by_day: Option<HashMap<String, f64>>,
+    aod_max: Option<f64>,
+    reject_unknown: bool,
 ) -> anyhow::Result<Vec<PeriodResult>> {
     use anyhow::Context;
     use futures::stream::{FuturesUnordered, StreamExt};
@@ -908,11 +923,17 @@ fn run_build_periods(
         // overlap, so the wall is unchanged — and gap months are never
         // scanned.)
         let t = Instant::now();
-        // STAC tolerates "yyyy-mm-31" for short months (extra days yield no
-        // items), so we avoid leap-year/last-day arithmetic.
+        // Use the calendar-correct last day per month. A hardcoded "-31"
+        // produces an invalid date for 30-day months (and February), which
+        // both Element84 earth-search and Planetary Computer reject with HTTP
+        // 400 — so that month's search fails outright rather than yielding no
+        // items. `last_day_of_month` keeps the range valid for every month.
         let period_datetimes: Vec<String> = periods
             .iter()
-            .map(|(y, m)| format!("{y:04}-{m:02}-01/{y:04}-{m:02}-31"))
+            .map(|(y, m)| {
+                let last = crate::pipeline::last_day_of_month(*y, *m);
+                format!("{y:04}-{m:02}-01/{y:04}-{m:02}-{last:02}")
+            })
             .collect();
         let search_futs = period_datetimes.iter().map(|dt| {
             let endpoint = &endpoint;
@@ -1107,6 +1128,9 @@ fn run_build_periods(
                 request_semaphore.clone(),
                 band_names_arc.as_ref(),
                 sel,
+                aod_by_day.as_ref(),
+                aod_max,
+                reject_unknown,
             )
             .await
             {
@@ -1156,6 +1180,9 @@ async fn compose_one_period(
     sem: Arc<tokio::sync::Semaphore>,
     band_names_out: &[String],
     sel: SelectParams,
+    aod_by_day: Option<&HashMap<String, f64>>,
+    aod_max: Option<f64>,
+    reject_unknown: bool,
 ) -> anyhow::Result<BuildResult> {
     use futures::stream::{FuturesUnordered, StreamExt};
     use std::time::Instant;
@@ -1164,11 +1191,24 @@ async fn compose_one_period(
 
     // Filter items to this period.
     let prefix = format!("{year:04}-{month:02}");
-    let period_items: Vec<crate::stac::StacItem> = items
+    let mut period_items: Vec<crate::stac::StacItem> = items
         .iter()
         .filter(|it| it.datetime.starts_with(&prefix))
         .cloned()
         .collect();
+    // Optional MAIAC-AOD day gate: drop atmospherically dirty days BEFORE
+    // best-pixel selection/compositing, so the composite uses only low-AOD
+    // acquisitions. No-op unless both `aod_max` and `aod_by_day` are supplied;
+    // days absent from the map are kept (unknown != dirty). See
+    // `pipeline::day_aod_passes`.
+    if aod_max.is_some() && aod_by_day.is_some() {
+        let before = period_items.len();
+        period_items
+            .retain(|it| {
+                crate::pipeline::day_aod_passes(&it.datetime, aod_by_day, aod_max, reject_unknown)
+            });
+        timings.insert("aod_rejected".to_string(), (before - period_items.len()) as f64);
+    }
 
     // Select scenes. Adaptive path uses per-chunk scout coverage to spend
     // depth only where it's needed; the legacy path takes a fixed top_k per

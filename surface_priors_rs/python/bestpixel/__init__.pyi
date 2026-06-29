@@ -64,6 +64,9 @@ def build_monthly_composites(
     min_k: int = 2,
     max_k: int = 8,
     windowed_fetch: bool = False,
+    aod_by_day: Optional[dict[str, float]] = None,
+    aod_max: Optional[float] = None,
+    reject_unknown: bool = False,
 ) -> list[dict[str, Any]]:
     """Build one composite per (year, month) in a single batch.
 
@@ -71,6 +74,16 @@ def build_monthly_composites(
     composes each period sequentially. Returns a list of per-period result
     dicts shaped like :func:`build_composite`'s, each tagged with ``year`` and
     ``month``. All selection/fetch params behave as in :func:`build_composite`.
+
+    Optional external-aerosol (e.g. MAIAC) day gate: pass ``aod_by_day`` mapping
+    ``"YYYY-MM-DD"`` acquisition days to an AOD value plus an ``aod_max``
+    threshold, and scenes whose day exceeds the threshold are dropped *before*
+    best-pixel selection/compositing — so the composite is built only from
+    low-AOD (atmospherically clean) days. Both must be given to activate the
+    gate; days absent from the map are kept (unknown is not treated as dirty)
+    unless ``reject_unknown=True``, which instead DROPS any day missing from the
+    map (keep only days with a vouched-for AOD). Each period's ``timings`` then
+    carries an ``aod_rejected`` count.
     """
     ...
 

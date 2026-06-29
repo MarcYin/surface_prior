@@ -1076,3 +1076,121 @@ impl Timing {
         (now.duration_since(start).as_secs_f64(), now)
     }
 }
+
+/// Optional external-aerosol (e.g. MAIAC) day-quality gate for the best-pixel
+/// composite. Returns `true` if a scene acquired on `datetime` should be KEPT.
+///
+/// When the gate is active, a scene is KEPT iff its `"YYYY-MM-DD"` acquisition
+/// day is present in `aod_by_day` with a value at or below `aod_max`. This lets
+/// a caller drop atmospherically dirty days *before* fetch+compose, so the
+/// composite is built only from low-AOD acquisitions — mirroring the L1C
+/// low-AOD day selection. When either `aod_max` or `aod_by_day` is `None` the
+/// gate is a no-op (keep everything).
+///
+/// Unknown days — absent from the map, or a malformed `datetime` — are governed
+/// by `reject_unknown`: `false` (the default) KEEPS them (missing AOD is not
+/// treated as dirty); `true` DROPS them (keep only days we can vouch for).
+pub fn day_aod_passes(
+    datetime: &str,
+    aod_by_day: Option<&HashMap<String, f64>>,
+    aod_max: Option<f64>,
+    reject_unknown: bool,
+) -> bool {
+    match (aod_max, aod_by_day) {
+        (Some(thr), Some(map)) => datetime
+            .get(..10)
+            .and_then(|day| map.get(day))
+            .map(|&aod| aod <= thr)
+            .unwrap_or(!reject_unknown),
+        _ => true,
+    }
+}
+
+/// Calendar-correct last day (28/29/30/31) of `month` in `year`, accounting
+/// for leap years. Used to build valid STAC datetime ranges per period — a
+/// hardcoded "-31" yields invalid dates for 30-day months and February, which
+/// STAC endpoints reject with HTTP 400.
+pub fn last_day_of_month(year: u32, month: u32) -> u32 {
+    match month {
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+            if leap {
+                29
+            } else {
+                28
+            }
+        }
+        _ => 31, // Jan/Mar/May/Jul/Aug/Oct/Dec (and any out-of-range guard)
+    }
+}
+
+#[cfg(test)]
+mod last_day_tests {
+    use super::last_day_of_month;
+
+    #[test]
+    fn known_month_lengths() {
+        assert_eq!(last_day_of_month(2020, 1), 31);
+        assert_eq!(last_day_of_month(2020, 6), 30); // June — the bug case
+        assert_eq!(last_day_of_month(2020, 9), 30);
+        assert_eq!(last_day_of_month(2020, 2), 29); // leap
+        assert_eq!(last_day_of_month(2021, 2), 28); // non-leap
+        assert_eq!(last_day_of_month(2000, 2), 29); // /400 leap
+        assert_eq!(last_day_of_month(1900, 2), 28); // /100 non-leap
+    }
+}
+
+#[cfg(test)]
+mod aod_gate_tests {
+    use super::day_aod_passes;
+    use std::collections::HashMap;
+
+    fn map() -> HashMap<String, f64> {
+        HashMap::from([
+            ("2020-06-12".to_string(), 0.08), // clean
+            ("2020-06-19".to_string(), 0.55), // dirty
+        ])
+    }
+
+    #[test]
+    fn keeps_clean_day_rejects_dirty_day() {
+        let m = map();
+        assert!(day_aod_passes("2020-06-12T10:30:00Z", Some(&m), Some(0.3), false));
+        assert!(!day_aod_passes("2020-06-19T10:30:00Z", Some(&m), Some(0.3), false));
+    }
+
+    #[test]
+    fn threshold_is_inclusive() {
+        let m = HashMap::from([("2020-06-12".to_string(), 0.30)]);
+        // aod == threshold is kept (<=), strictly-above is rejected.
+        assert!(day_aod_passes("2020-06-12T00:00:00Z", Some(&m), Some(0.30), false));
+        assert!(!day_aod_passes("2020-06-12T00:00:00Z", Some(&m), Some(0.29), false));
+    }
+
+    #[test]
+    fn unknown_day_kept_by_default_rejected_when_opted_in() {
+        let m = map();
+        // default: unknown day kept
+        assert!(day_aod_passes("2021-01-01T10:30:00Z", Some(&m), Some(0.1), false));
+        // reject_unknown: unknown day dropped
+        assert!(!day_aod_passes("2021-01-01T10:30:00Z", Some(&m), Some(0.1), true));
+        // a KNOWN clean day still passes even with reject_unknown
+        assert!(day_aod_passes("2020-06-12T10:30:00Z", Some(&m), Some(0.3), true));
+    }
+
+    #[test]
+    fn no_op_when_either_arg_missing() {
+        let m = map();
+        // gate inactive -> reject_unknown is irrelevant, keep everything
+        assert!(day_aod_passes("2020-06-19T10:30:00Z", Some(&m), None, true));
+        assert!(day_aod_passes("2020-06-19T10:30:00Z", None, Some(0.1), true));
+    }
+
+    #[test]
+    fn malformed_datetime_follows_reject_unknown() {
+        let m = map();
+        assert!(day_aod_passes("bad", Some(&m), Some(0.1), false));
+        assert!(!day_aod_passes("bad", Some(&m), Some(0.1), true));
+    }
+}
