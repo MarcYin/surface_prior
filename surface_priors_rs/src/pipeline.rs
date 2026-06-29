@@ -1008,6 +1008,10 @@ pub struct Composite {
     pub selected_observation: Vec<i16>,
     /// In order they were composed; index matches `selected_observation`.
     pub source_ids: Vec<String>,
+    /// Optional per-band temporal-spread uncertainty (DN units, NaN where the
+    /// winning pixel is nodata); `Some` only when `emit_uncertainty` was set.
+    /// Length = N bands, each `width*height`.
+    pub reflectance_std: Option<Vec<Vec<f32>>>,
 }
 
 /// Best-pixel compose across all selected observations. Quality
@@ -1018,6 +1022,7 @@ pub fn compose_best_pixel(
     n_bands: usize,
     observations: Vec<(String, Vec<Vec<u16>>, Vec<u8>)>,
     kind: QualityKind,
+    emit_uncertainty: bool,
 ) -> Composite {
     let n_pixels = (grid.width * grid.height) as usize;
     const NODATA: u16 = 65535;
@@ -1031,6 +1036,17 @@ pub fn compose_best_pixel(
         .map(|(_, _, q)| quality_to_score(q, kind))
         .collect();
 
+    // Per-band Welford accumulators for the temporal-spread uncertainty,
+    // allocated only when requested (zero overhead on the default path).
+    let mut acc_count: Vec<Vec<u32>> = Vec::new();
+    let mut acc_mean: Vec<Vec<f32>> = Vec::new();
+    let mut acc_m2: Vec<Vec<f32>> = Vec::new();
+    if emit_uncertainty {
+        acc_count = (0..n_bands).map(|_| vec![0u32; n_pixels]).collect();
+        acc_mean = (0..n_bands).map(|_| vec![0.0f32; n_pixels]).collect();
+        acc_m2 = (0..n_bands).map(|_| vec![0.0f32; n_pixels]).collect();
+    }
+
     for (obs_idx, (_, bands_data, _)) in observations.iter().enumerate() {
         let quality = &qualities[obs_idx];
         let obs_i16 = obs_idx as i16;
@@ -1040,6 +1056,22 @@ pub fn compose_best_pixel(
                 continue;
             }
             observation_count[p] = observation_count[p].saturating_add(1);
+            if emit_uncertainty {
+                // Running per-band mean/M2 over every valid observation (not
+                // just the winner) — the spread across candidate days.
+                for (b, band) in bands_data.iter().enumerate() {
+                    let v = band[p];
+                    if v == NODATA {
+                        continue;
+                    }
+                    let x = v as f32;
+                    let c = acc_count[b][p] + 1;
+                    acc_count[b][p] = c;
+                    let delta = x - acc_mean[b][p];
+                    acc_mean[b][p] += delta / c as f32;
+                    acc_m2[b][p] += delta * (x - acc_mean[b][p]);
+                }
+            }
             if q < best_quality[p] {
                 best_quality[p] = q;
                 selected_observation[p] = obs_i16;
@@ -1049,6 +1081,37 @@ pub fn compose_best_pixel(
             }
         }
     }
+
+    // Finalize per-band temporal-spread uncertainty (DN units; NaN where the
+    // winning pixel is nodata). unc = sqrt(sample_var + (REL_FLOOR*boa)^2),
+    // floored at ABS_FLOOR_DN so it is always finite & positive; the solver
+    // re-floors in reflectance space. n < 2 falls back to the relative floor.
+    let reflectance_std: Option<Vec<Vec<f32>>> = if emit_uncertainty {
+        const REL_FLOOR: f32 = 0.02; // 2% of reflectance
+        const ABS_FLOOR_DN: f32 = 10.0; // 0.001 reflectance (DN = refl * 10000)
+        let mut std_bands: Vec<Vec<f32>> =
+            (0..n_bands).map(|_| vec![f32::NAN; n_pixels]).collect();
+        for b in 0..n_bands {
+            for p in 0..n_pixels {
+                let boa = best_data[b][p];
+                if boa == NODATA {
+                    continue;
+                }
+                let c = acc_count[b][p];
+                let var = if c >= 2 {
+                    acc_m2[b][p] / (c as f32 - 1.0)
+                } else {
+                    0.0
+                };
+                let rel = REL_FLOOR * boa as f32;
+                std_bands[b][p] = (var + rel * rel).sqrt().max(ABS_FLOOR_DN);
+            }
+        }
+        Some(std_bands)
+    } else {
+        None
+    };
+
     Composite {
         grid: grid.clone(),
         bands: best_data,
@@ -1056,6 +1119,7 @@ pub fn compose_best_pixel(
         observation_count,
         selected_observation,
         source_ids,
+        reflectance_std,
     }
 }
 
@@ -1138,6 +1202,68 @@ mod last_day_tests {
         assert_eq!(last_day_of_month(2021, 2), 28); // non-leap
         assert_eq!(last_day_of_month(2000, 2), 29); // /400 leap
         assert_eq!(last_day_of_month(1900, 2), 28); // /100 non-leap
+    }
+}
+
+#[cfg(test)]
+mod compose_unc_tests {
+    use super::compose_best_pixel;
+    use crate::endpoint::QualityKind;
+    use crate::grid::GridSpec;
+
+    fn grid_2px() -> GridSpec {
+        GridSpec {
+            bounds: [0.0, 0.0, 120.0, 60.0],
+            epsg: 32631,
+            proj4: None,
+            resolution: 60.0,
+            width: 2,
+            height: 1,
+        }
+    }
+
+    #[test]
+    fn emit_uncertainty_off_yields_no_std() {
+        // SCL 4 = clear (score 0); single band, two pixels.
+        let obs = vec![(
+            "a".to_string(),
+            vec![vec![1000u16, 500u16]],
+            vec![4u8, 4u8],
+        )];
+        let c = compose_best_pixel(&grid_2px(), 1, obs, QualityKind::Scl, false);
+        assert!(c.reflectance_std.is_none());
+    }
+
+    #[test]
+    fn per_band_temporal_std_with_floor_and_single_sample() {
+        // pixel0: 3 clear obs (1000,1100,1200) -> sample std 100, +2% rel floor of
+        //   the winner (lowest-quality tie -> first = 1000, rel = 20) => ~101.98.
+        // pixel1: only obs "a" is clear (others SCL 0 = nodata) -> n=1 -> var 0,
+        //   unc = max(rel_floor*500=10, abs_floor 10) = 10.
+        let obs = vec![
+            ("a".to_string(), vec![vec![1000u16, 500u16]], vec![4u8, 4u8]),
+            ("b".to_string(), vec![vec![1100u16, 65535u16]], vec![4u8, 0u8]),
+            ("c".to_string(), vec![vec![1200u16, 65535u16]], vec![4u8, 0u8]),
+        ];
+        let c = compose_best_pixel(&grid_2px(), 1, obs, QualityKind::Scl, true);
+        let std = c.reflectance_std.expect("std present");
+        assert_eq!(c.observation_count[0], 3);
+        assert_eq!(c.observation_count[1], 1);
+        assert!((std[0][0] - 101.98).abs() < 1.0, "pixel0 std = {}", std[0][0]);
+        assert!((std[0][1] - 10.0).abs() < 0.5, "pixel1 std = {}", std[0][1]);
+    }
+
+    #[test]
+    fn nodata_pixel_std_is_nan() {
+        // both observations nodata at pixel1 -> winner nodata -> std NaN there.
+        let obs = vec![
+            ("a".to_string(), vec![vec![1000u16, 65535u16]], vec![4u8, 0u8]),
+            ("b".to_string(), vec![vec![1100u16, 65535u16]], vec![4u8, 0u8]),
+        ];
+        let c = compose_best_pixel(&grid_2px(), 1, obs, QualityKind::Scl, true);
+        let std = c.reflectance_std.unwrap();
+        assert!(std[0][0].is_finite());
+        assert!(std[0][1].is_nan());
     }
 }
 

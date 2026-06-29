@@ -72,12 +72,17 @@ def build_l1c_composite(
     max_k: int = 8,
     workers: int = 16,
     out: Optional[str] = None,
+    emit_uncertainty: bool = False,
     ee_module: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Build an L1C custom-AC surface-reflectance composite.
 
     Returns ``{"bands": {name: (H,W) float32}, "grid": {...}, "count": (H,W),
     "scenes": [...]}`` and, if ``out`` is given, writes a scaled int16 GeoTIFF.
+    When ``emit_uncertainty`` is set, also returns ``"boa_unc": {name: (H,W)
+    float32}`` — the per-band temporal spread (reflectance units, same scale as
+    ``bands``) across the clear low-AOD scenes, sqrt(sample_var + (2%*boa)^2),
+    floored at 0.001; NaN where the composite is empty.
     """
     ee = init_ee(ee_module=ee_module)
     sc = AtmoSidecar.load(sidecar)
@@ -158,6 +163,12 @@ def build_l1c_composite(
     best_cs = np.full((h, w), -1.0, np.float32)
     best_aod = np.full((h, w), np.inf, np.float32)
     count = np.zeros((h, w), np.int16)
+    # Per-band Welford accumulators for the temporal-spread uncertainty (only
+    # when requested). Reflectance units, matching `best`.
+    if emit_uncertainty:
+        acc_n = np.zeros((nb, h, w), np.float32)
+        acc_mean = np.zeros((nb, h, w), np.float32)
+        acc_m2 = np.zeros((nb, h, w), np.float32)
     for (ci, sid), p in pieces.items():
         if "l1c" not in p or "cs" not in p:
             continue
@@ -169,6 +180,17 @@ def build_l1c_composite(
         clear = cs > cs_thresh
         sl = (slice(r0, r0 + ch), slice(c0, c0 + cw))
         count[sl] += clear.astype(np.int16)
+        if emit_uncertainty:
+            for bi in range(nb):
+                sb = surf[bi]
+                use = clear & np.isfinite(sb)
+                msl = acc_mean[bi][sl]
+                nnew = acc_n[bi][sl] + use
+                delta = np.where(use, sb - msl, 0.0)
+                mnew = msl + np.where(use, delta / np.maximum(nnew, 1.0), 0.0)
+                acc_m2[bi][sl] += delta * (np.where(use, sb, mnew) - mnew)
+                acc_mean[bi][sl] = mnew
+                acc_n[bi][sl] = nnew
         bcs, baod = best_cs[sl], best_aod[sl]
         if rank == "aod":
             win = clear & ((aod < baod) | ((aod == baod) & (cs > bcs)))
@@ -185,6 +207,17 @@ def build_l1c_composite(
         "count": count,
         "scenes": list(coarse),
     }
+    if emit_uncertainty:
+        boa_unc = {}
+        for bi, name in enumerate(band_names):
+            n = acc_n[bi]
+            var = np.where(n >= 2, acc_m2[bi] / np.maximum(n - 1.0, 1.0), 0.0)
+            rel = 0.02 * best[bi]
+            unc = np.sqrt(var + rel * rel).astype(np.float32)
+            unc = np.maximum(unc, np.float32(0.001))
+            unc[~np.isfinite(best[bi])] = np.nan
+            boa_unc[name] = unc
+        result["boa_unc"] = boa_unc
     if out is not None:
         _write_geotiff(out, best, band_names, grid)
         result["path"] = out

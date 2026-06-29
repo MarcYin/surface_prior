@@ -18,8 +18,13 @@ def build_composite(
     min_k: int = 2,
     max_k: int = 8,
     windowed_fetch: bool = False,
+    emit_uncertainty: bool = False,
 ) -> dict[str, Any]:
     """Build one best-pixel composite over ``bbox`` for the ``datetime`` range.
+
+    When ``emit_uncertainty`` is set, the result also carries ``boa_unc``: a
+    dict ``{band_name: (H, W) float32}`` of per-band temporal-spread uncertainty
+    (reflectance DN, same scale as ``bands``; NaN where the pixel is nodata).
 
     Returns a dict with per-band ``numpy`` arrays plus ``observation_count``,
     ``selected_observation``, ``quality``, ``source_ids``, ``grid``,
@@ -67,6 +72,7 @@ def build_monthly_composites(
     aod_by_day: Optional[dict[str, float]] = None,
     aod_max: Optional[float] = None,
     reject_unknown: bool = False,
+    emit_uncertainty: bool = False,
 ) -> list[dict[str, Any]]:
     """Build one composite per (year, month) in a single batch.
 
@@ -84,6 +90,9 @@ def build_monthly_composites(
     unless ``reject_unknown=True``, which instead DROPS any day missing from the
     map (keep only days with a vouched-for AOD). Each period's ``timings`` then
     carries an ``aod_rejected`` count.
+
+    ``emit_uncertainty=True`` adds a per-band ``boa_unc`` dict to each period
+    result (same shape/scale as ``bands``; see :func:`build_composite`).
     """
     ...
 

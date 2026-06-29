@@ -476,7 +476,7 @@ async fn async_main() -> Result<()> {
     // --- Compose best-pixel ------------------------------------------------
     let t = Instant::now();
     let composite =
-        compose_best_pixel(&grid, band_names_out.len(), observations, quality_kind);
+        compose_best_pixel(&grid, band_names_out.len(), observations, quality_kind, false);
     timing.compose = t.elapsed().as_secs_f64();
     eprintln!("compose:        {:6.2}s", timing.compose);
 

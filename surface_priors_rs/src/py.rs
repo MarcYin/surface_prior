@@ -173,6 +173,7 @@ use crate::tile_classification::{build_partition, chunks_from_grid, scenes_signa
     min_k = 2,
     max_k = 8,
     windowed_fetch = false,
+    emit_uncertainty = false,
 ))]
 #[allow(clippy::too_many_arguments)]
 fn build_composite(
@@ -192,6 +193,8 @@ fn build_composite(
     min_k: usize,
     max_k: usize,
     windowed_fetch: bool,
+    // When true, also emit a per-band `boa_unc` temporal-spread uncertainty.
+    emit_uncertainty: bool,
 ) -> PyResult<Bound<'_, PyDict>> {
     let sel = SelectParams { top_k, coverage_target, min_k, max_k, windowed: windowed_fetch };
     // Release the GIL while the heavy async work runs — lets concurrent
@@ -200,7 +203,7 @@ fn build_composite(
         .allow_threads(|| {
             run_build(
                 bbox, datetime, resolution, sel, max_cloud_cover, concurrency, endpoint,
-                disk_cache, scout_factor, bands, output_crs,
+                disk_cache, scout_factor, bands, output_crs, emit_uncertainty,
             )
         })
         .map_err(|e| PyRuntimeError::new_err(format!("{e:#}")))?;
@@ -228,6 +231,7 @@ fn build_composite(
     aod_by_day = None,
     aod_max = None,
     reject_unknown = false,
+    emit_uncertainty = false,
 ))]
 #[allow(clippy::too_many_arguments)]
 fn build_monthly_composites(
@@ -256,6 +260,8 @@ fn build_monthly_composites(
     // When the gate is active, also drop scenes whose day is ABSENT from
     // `aod_by_day` (default false = keep unknown days).
     reject_unknown: bool,
+    // When true, also emit a per-band `boa_unc` temporal-spread uncertainty.
+    emit_uncertainty: bool,
 ) -> PyResult<Bound<'_, PyList>> {
     if years.is_empty() {
         return Err(PyRuntimeError::new_err("years must be non-empty"));
@@ -276,7 +282,7 @@ fn build_monthly_composites(
             run_build_periods(
                 bbox, years, months, resolution, sel, max_cloud_cover, concurrency,
                 endpoint, disk_cache, scout_factor, bands, output_crs, aod_by_day, aod_max,
-                reject_unknown,
+                reject_unknown, emit_uncertainty,
             )
         })
         .map_err(|e| PyRuntimeError::new_err(format!("{e:#}")))?;
@@ -298,6 +304,8 @@ struct BuildResult {
     observation_count: Vec<u16>,
     selected_observation: Vec<i16>,
     source_ids: Vec<String>,
+    /// Optional per-band temporal-spread uncertainty (DN; NaN = nodata).
+    reflectance_std: Option<Vec<Vec<f32>>>,
     timings: HashMap<String, f64>,
     endpoint_url: String,
     collection: String,
@@ -400,6 +408,7 @@ fn run_build(
     scout_factor: u32,
     bands_subset: Option<Vec<String>>,
     output_crs: String,
+    emit_uncertainty: bool,
 ) -> anyhow::Result<BuildResult> {
     use anyhow::Context;
     use futures::stream::{FuturesUnordered, StreamExt};
@@ -800,7 +809,7 @@ fn run_build(
         // 5. compose
         let t = Instant::now();
         let composite =
-            compose_best_pixel(&grid, band_names_out.len(), observations, quality_kind);
+            compose_best_pixel(&grid, band_names_out.len(), observations, quality_kind, emit_uncertainty);
         timings.insert("compose".to_string(), t.elapsed().as_secs_f64());
         timings.insert("total".to_string(), t_total.elapsed().as_secs_f64());
 
@@ -826,6 +835,7 @@ fn run_build(
             observation_count: composite.observation_count,
             selected_observation: composite.selected_observation,
             source_ids: composite.source_ids,
+            reflectance_std: composite.reflectance_std,
             timings,
             endpoint_url: endpoint.stac_url.clone(),
             collection: endpoint.collections_key(),
@@ -858,6 +868,7 @@ fn run_build_periods(
     aod_by_day: Option<HashMap<String, f64>>,
     aod_max: Option<f64>,
     reject_unknown: bool,
+    emit_uncertainty: bool,
 ) -> anyhow::Result<Vec<PeriodResult>> {
     use anyhow::Context;
     use futures::stream::{FuturesUnordered, StreamExt};
@@ -1131,6 +1142,7 @@ fn run_build_periods(
                 aod_by_day.as_ref(),
                 aod_max,
                 reject_unknown,
+                emit_uncertainty,
             )
             .await
             {
@@ -1183,6 +1195,7 @@ async fn compose_one_period(
     aod_by_day: Option<&HashMap<String, f64>>,
     aod_max: Option<f64>,
     reject_unknown: bool,
+    emit_uncertainty: bool,
 ) -> anyhow::Result<BuildResult> {
     use futures::stream::{FuturesUnordered, StreamExt};
     use std::time::Instant;
@@ -1382,7 +1395,7 @@ async fn compose_one_period(
 
     let t = Instant::now();
     let composite =
-        compose_best_pixel(grid, band_names_out.len(), observations, quality_kind);
+        compose_best_pixel(grid, band_names_out.len(), observations, quality_kind, emit_uncertainty);
     timings.insert("compose".to_string(), t.elapsed().as_secs_f64());
     timings.insert("total".to_string(), t_total.elapsed().as_secs_f64());
 
@@ -1408,6 +1421,7 @@ async fn compose_one_period(
         observation_count: composite.observation_count,
         selected_observation: composite.selected_observation,
         source_ids: composite.source_ids,
+        reflectance_std: composite.reflectance_std,
         timings,
         endpoint_url: endpoint.stac_url.clone(),
         collection: endpoint.collections_key(),
@@ -1434,6 +1448,19 @@ fn encode_result(py: Python<'_>, r: BuildResult) -> PyResult<Bound<'_, PyDict>> 
         bands.set_item(name.as_str(), arr2.into_pyarray_bound(py))?;
     }
     out.set_item("bands", bands)?;
+
+    // Optional per-band temporal-spread uncertainty (reflectance DN units, NaN
+    // = nodata), emitted only when build was called with emit_uncertainty.
+    if let Some(mut std_owned) = r.reflectance_std {
+        let boa_unc = PyDict::new_bound(py);
+        for (i, name) in band_names_out.iter().enumerate() {
+            let band = std::mem::take(&mut std_owned[i]);
+            let arr2 = Array2::from_shape_vec((h, w), band)
+                .map_err(|e| PyRuntimeError::new_err(format!("reshape boa_unc {name}: {e}")))?;
+            boa_unc.set_item(name.as_str(), arr2.into_pyarray_bound(py))?;
+        }
+        out.set_item("boa_unc", boa_unc)?;
+    }
 
     // Auxiliary arrays.
     let quality_arr = Array2::from_shape_vec((h, w), r.quality)
